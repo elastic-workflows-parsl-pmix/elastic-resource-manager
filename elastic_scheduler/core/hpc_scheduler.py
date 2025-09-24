@@ -108,19 +108,73 @@ class HPCScheduler:
                 ).start()
                 return
 
-        available = len(self.node_manager.read_hostfile())
+        self.backfill_jobs()
+        
+        available = self._available_nodes()
         if not allocated and available > 0 and len(self.running_jobs) > 0:  # fragmented
-            if self.schedule_type == 0:
-                logger.info("Free nodes detected with running jobs. Attempting expansion.")
-                expanded = elastic_expand(self.running_jobs, available, self.node_manager, self.policy_file)
-                if expanded > 0:
-                    self._notify()
-            else:
-                min_allocation_job = job.spec.min_nodes if job else 0
-                logger.info("Free nodes detected with running jobs. Attempting shrinking.")
-                shrunk = elastic_shrink(self.running_jobs, min_allocation_job, self.node_manager, self.policy_file)
-                if shrunk > 0:
-                    self._notify()
+            self.optimize_resource_fragmentation(available, job)
+
+    def backfill_jobs(self) -> None:
+        # --- Backfilling: try to run a smaller job without delaying the head job ---
+        # Snapshot state for safe computations outside the lock
+        with self.cv:
+            queue_snapshot = list(self.job_queue)
+            running_snapshot = list(self.running_jobs)
+        if queue_snapshot:
+            head = queue_snapshot[0]
+            available_now = self._available_nodes()
+            if available_now > 0:
+                t_res = self._reserve_time_for_head(head, available_now, running_snapshot)
+                now = time.time()
+                backfill = None
+                for cand in queue_snapshot[1:]:
+                    cand_req = cand.spec.min_nodes if self.schedule_type == 0 else cand.spec.max_nodes
+                    if cand_req <= available_now:
+                        cand_wt = self._walltime_seconds(cand.walltime)
+                        if cand_wt > 0 and (now + cand_wt) <= t_res:
+                            backfill = (cand, cand_req)
+                            break
+
+                if backfill:
+                    cand, cand_req = backfill
+                    bf_nodes = self.node_manager.allocate_nodes(cand_req)
+                    if bf_nodes:
+                        committed = False
+                        with self.cv:
+                            # Ensure the candidate is still queued; remove by identity
+                            try:
+                                self.job_queue.remove(cand)
+                                cand.start(bf_nodes)
+                                self.running_jobs.append(cand)
+                                threading.Thread(
+                                    target=self.execute_job,
+                                    args=(cand,),
+                                    name=f"Job-{cand.spec.id}",
+                                    daemon=True,
+                                ).start()
+                                logger.info(f"Backfilled Job {cand.id} (req={cand_req}) before head Job {head.id}")
+                                committed = True
+                            except ValueError:
+                                committed = False
+                        if committed:
+                            return
+                        else:
+                            # Candidate disappeared; return nodes
+                            self.node_manager.free_nodes(bf_nodes)
+
+    def optimize_resource_fragmentation(self, available: int, job: JobRecord) -> None:
+        """Attempt to reduce resource fragmentation by expanding or shrinking jobs."""
+        if self.schedule_type == 0:
+            logger.info("Free nodes detected with running jobs. Attempting expansion.")
+            expanded = elastic_expand(self.running_jobs, available, self.node_manager, self.policy_file)
+            if expanded > 0:
+                self._notify()
+        else:
+            min_allocation_job = job.spec.min_nodes if job else 0
+            logger.info("Free nodes detected with running jobs. Attempting shrinking.")
+            shrunk = elastic_shrink(self.running_jobs, min_allocation_job, self.node_manager, self.policy_file)
+            if shrunk > 0:
+                self._notify()
     
     # ------------ Job execution ------------
 
@@ -300,3 +354,58 @@ class HPCScheduler:
         with self.cv:
             logger.info(f"Notifying scheduler - queue:{len(self.job_queue)}, nodes:{self._available_nodes()}")
             self.cv.notify_all()
+
+    def _walltime_seconds(self, wt: str | None) -> int:
+        """Parse walltime 'HH:MM:SS' (or 'MM:SS', or seconds) to seconds; 0 if unknown."""
+        if not wt:
+            return 0
+        try:
+            parts = [int(p) for p in str(wt).split(":")]
+            if len(parts) == 3:
+                h, m, s = parts
+            elif len(parts) == 2:
+                h, m, s = 0, parts[0], parts[1]
+            elif len(parts) == 1:
+                h, m, s = 0, 0, parts[0]
+            else:
+                return 0
+            return h * 3600 + m * 60 + s
+        except Exception:
+            return 0
+
+    def _reserve_time_for_head(self, head: JobRecord, idle_now: int, running_snapshot: List[JobRecord]) -> float:
+        """
+        Compute earliest time when 'head' can start (EASY reservation).
+        Returns epoch seconds T* such that at least head.req nodes are available by T*.
+        """
+        now = time.time()
+        if not head:
+            return now
+        req = head.spec.min_nodes if self.schedule_type == 0 else head.spec.max_nodes
+        if idle_now >= req:
+            return now
+
+        # Build release timeline from running jobs
+        events: List[tuple[float, int]] = []
+        for r in running_snapshot:
+            # need start_time and walltime for ETA; if unknown, be conservative (far future)
+            st = getattr(r.runtime, "start_time", None)
+            wt = self._walltime_seconds(getattr(r, "walltime", None))
+            if st is None or wt <= 0:
+                # push very far so we don't accidentally delay the head
+                eta = now + 365*24*3600
+            else:
+                eta = st + wt
+            nodes_release = len(getattr(r, "nodes", []) or getattr(r.runtime, "nodes", []))
+            if nodes_release > 0:
+                events.append((eta, nodes_release))
+
+        events.sort(key=lambda x: x[0])
+        have = idle_now
+        for t, rel in events:
+            have += rel
+            if have >= req:
+                return t
+
+        # If still not enough, head cannot be guaranteed; return far future
+        return now + 365*24*3600
