@@ -100,3 +100,23 @@ class JobRecord:
     def complete(self, success: bool) -> None:
         self.runtime.completion_time = time.time()
         self.status = JobStatus.COMPLETED if success else JobStatus.FAILED
+
+class JobRequest:
+    job_requests_counter = 1
+    def __init__(self, job_id, scale, num_nodes, status):
+        self.id = JobRequest.job_requests_counter
+        self.job_id = job_id
+        self.scale = scale
+        self.num_nodes = num_nodes
+        self.status = status
+        JobRequest.job_requests_counter += 1
+
+    @staticmethod
+    def from_dict(job_dict):
+        """Create a Job object from a dictionary."""
+        return JobRequest(
+            job_id=job_dict["job_id"],
+            scale=job_dict["scale"],
+            num_nodes=job_dict["num_nodes"],
+            status=job_dict["status"]
+        )

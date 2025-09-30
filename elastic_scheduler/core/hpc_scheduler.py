@@ -10,10 +10,11 @@ from collections import deque
 from pathlib import Path
 from typing import Deque, Dict, List, Any
 
-from elastic_scheduler.jobs.job import JobRecord, JobStatus
+from elastic_scheduler.jobs.job import JobRecord, JobStatus, JobRequest
 from elastic_scheduler.core.elastic_scheduler import (
     expand_elastic_jobs as elastic_expand,
     shrink_elastic_jobs as elastic_shrink,
+    handle_evolving_job_requests as handle_evolving
 )
 
 logger = logging.getLogger(__name__)
@@ -24,14 +25,16 @@ class HPCScheduler:
     Coordinates job scheduling, expansion, shrinking, and execution.
     """
 
-    def __init__(self, node_manager: Any, job_file: str, policy_file: str, dvm_file: str, schedule_type: int) -> None:
+    def __init__(self, node_manager: Any, job_file: str, policy_file: str, dvm_file: str, evolving_job_requests_file: str, schedule_type: int) -> None:
         self.node_manager = node_manager
         self.job_queue: Deque[JobRecord] = deque()
         self.running_jobs: List[JobRecord] = []
         self.completed_jobs: List[JobRecord] = []
+        self.evolving_job_requests_file = evolving_job_requests_file
         self.job_file = job_file
         self.policy_file = policy_file
         self.completed_log_file = os.path.join(os.path.dirname(self.job_file) or ".", "completed_jobs.jsonl")
+        self.pending_job_requests: Deque[JobRequest] = deque()
         self.schedule_type = schedule_type
         self.dvm_file = dvm_file
 
@@ -49,6 +52,13 @@ class HPCScheduler:
             logger.info(f"Job {job.id} submitted and queued.")
             return job.id
 
+    def submit_evolving_job_requests(self,  job_request: JobRequest) -> None:
+        """Submit a evolving job request to the scheduler queue."""
+        with self.lock:
+            self.pending_job_requests.append(job_request)
+            logger.info(f"Evolving job request for job {job_request.job_id} submitted and queued.")
+            self.cv.notify()
+
     def start(self) -> None:
         """Start the scheduler in a separate thread."""
         t = threading.Thread(target=self._run_loop, name="HPCScheduler", daemon=True)
@@ -65,7 +75,8 @@ class HPCScheduler:
             with self.cv:
                 qsize = len(self.job_queue)
                 rsize = len(self.running_jobs)
-                if qsize == 0:
+                has_req = bool(self.pending_job_requests)
+                if qsize == 0 and not has_req:
                     logger.info(f"Scheduler waiting. Queue size: {qsize}, Running: {rsize}")
                     self.cv.wait(timeout=5.0)
                     logger.info(f"Scheduler woke up. Queue size: {len(self.job_queue)}")
@@ -78,25 +89,14 @@ class HPCScheduler:
             except Exception as e:
                 logger.exception(f"Scheduling iteration failed: {e}")
 
-    def _attempt_scheduling(self) -> None:
-        """Try to schedule jobs, expand elastic jobs, or shrink when fragmented."""
+    def schedule_pending_jobs(self, job: JobRecord) -> bool:
+        """Try to schedule pending jobs from the queue."""
+        logger.info(f"Scheduling attempt: {len(self.job_queue)} jobs in queue")
+        logger.info(f"Attempting to schedule Job {job.id} (min_nodes={job.min_nodes}, max_nodes={job.max_nodes})")
+        req = job.spec.min_nodes if self.schedule_type == 0 else job.spec.max_nodes
+        allocated = self.node_manager.allocate_nodes(req)
         with self.cv:
-            # prune finished (job threads only set status; scheduler owns the list)
-            self.running_jobs = [j for j in self.running_jobs if j.status == JobStatus.RUNNING]
-            if self.job_queue:
-                job = self.job_queue[0]
-                req = job.spec.min_nodes if self.schedule_type == 0 else job.spec.max_nodes
-            else:
-                job = None
-                req = 0
-            logger.info(f"Scheduling attempt: {len(self.job_queue)} jobs in queue")
-
-        allocated = None
-        if job:
-            allocated = self.node_manager.allocate_nodes(req)
-
-        with self.cv:
-            if job and allocated and self.job_queue and self.job_queue[0] is job:
+            if allocated and self.job_queue and self.job_queue[0] is job:
                 self.job_queue.popleft()
                 job.start(allocated)
                 self.running_jobs.append(job)
@@ -106,12 +106,58 @@ class HPCScheduler:
                     name=f"Job-{job.spec.id}",
                     daemon=True,
                 ).start()
-                return
+                return True
+   
+        return False
 
-        self.backfill_jobs()
-        
+    def schedule_job_request(self, job_request: JobRequest) -> bool:
+        with self.cv:
+            if not self.pending_job_requests or self.pending_job_requests[0] is not job_request:
+                return False
+            self.pending_job_requests.popleft()
+
+        job_id = job_request.job_id
+        job_record = next((j for j in self.running_jobs if str(j.id) == str(job_id)), None)
+        if not job_record:
+            logger.info(f"Evolving request for unknown/finished job {job_id}; discarding.")
+            return False
+        handle_evolving(job_request, job_record, self._available_nodes(), self.node_manager, self.policy_file, self.evolving_job_requests_file)
+        return True
+
+    def _attempt_scheduling(self) -> None:
+        """Try to schedule jobs, expand elastic jobs, or shrink when fragmented."""
+        with self.cv:
+            self.running_jobs = [j for j in self.running_jobs if j.status == JobStatus.RUNNING]
+            job = self.job_queue[0] if self.job_queue else None
+            job_request = self.pending_job_requests[0] if self.pending_job_requests else None
+
+        # 1) Handle pending work first (jobs and requests)
+        if job or job_request:
+            if job and not job_request:
+                if self.schedule_pending_jobs(job):
+                    logger.info(f"Scheduled Job {job.id} from queue.")
+                    # Don't return here - continue to check for expansion
+            elif job_request and not job:
+                if self.schedule_job_request(job_request):
+                    logger.info(f"Scheduled Job Request {job_request.id}.")
+                    return  # Evolving requests are immediate; no expansion after
+            else:
+                # Prioritize job requests over queued jobs
+                if self.schedule_job_request(job_request):
+                    logger.info(f"Scheduled Job Request {job_request.id}.")
+                    return
+                if self.schedule_pending_jobs(job):
+                    logger.info(f"Scheduled Job {job.id} from queue.")
+                    # Continue to expansion even if we scheduled a job
+
+            # If head job couldn't start, try backfill
+            if job and len(self.job_queue) > 0:  # Head still exists
+                self.backfill_jobs()
+
+        # 2) Always check for elastic opportunities when nodes are free
         available = self._available_nodes()
-        if not allocated and available > 0 and len(self.running_jobs) > 0:  # fragmented
+        if available > 0 and len(self.running_jobs) > 0:
+            logger.info(f"Free nodes available ({available}), attempting elastic optimization.")
             self.optimize_resource_fragmentation(available, job)
 
     def backfill_jobs(self) -> None:
@@ -189,23 +235,28 @@ class HPCScheduler:
                 f"prun --dvm-uri file:{self.dvm_file} --host {nodes_with_slots} "
                 f"--map-by node --bind-to none -n {len(rj.nodes)} "
             )
-        if "--nodelist " in command:
-            command = command.replace("--nodelist ", f"--nodelist {nodes_str} ")
-            command = command.replace("--job_id ", f"--job_id {rj.id} ")
-            command = command.replace("--nnodes ", f"--nnodes {len(rj.nodes)} ")
-            command = command.replace("--wt", f"--wt {rj.walltime}")  # fixed
+        # if "--nodelist " in command:
+        #     command = command.replace("--nodelist ", f"--nodelist {nodes_str} ")
+        #     command = command.replace("--job_id ", f"--job_id {rj.id} ")
+        #     command = command.replace("--nnodes ", f"--nnodes {len(rj.nodes)} ")
+        #     command = command.replace("--wt", f"--wt {rj.walltime}")  # fixed
+        if "--nodelist " in rj.command:
+            command = rj.command.replace("--nodelist ", "--nodelist {} ".format(nodes_str))
+            command = command.replace("--job_id ", "--job_id {} ".format(rj.id))
+            command = command.replace("--nnodes ", "--nnodes {} --minnodes {} --maxnodes {} ".format(len(rj.nodes), rj.min_nodes, rj.max_nodes))
+            command = command.replace("--wt", "--wt {}".format(rj.walltime))
         if "-L" in command:
             command = command.replace(
                 "-L", f"-L {nodes_str} -N {len(rj.nodes)} -J {rj.id} "
             )
-        if "NUM_NODES" in command:
-            command = command.replace(
-                "NUM_NODES_EXAMOL ",
-                f"NUM_NODES_EXAMOL={len(rj.nodes)} "
-                f"NODES_EXAMOL={nodes_str} "
-                f"JOB_ID_EXAMOL={rj.id} "
-                f"WALLTIME_EXAMOL={rj.walltime} "
-            )
+        # if "NUM_NODES" in command:
+        #     command = command.replace(
+        #         "NUM_NODES_EXAMOL ",
+        #         f"NUM_NODES_EXAMOL={len(rj.nodes)} "
+        #         f"NODES_EXAMOL={nodes_str} "
+        #         f"JOB_ID_EXAMOL={rj.id} "
+        #         f"WALLTIME_EXAMOL={rj.walltime} "
+        #     )
         return command
     
     def execute_job(self, rj: JobRecord) -> None:
