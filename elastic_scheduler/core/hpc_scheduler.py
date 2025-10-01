@@ -25,7 +25,7 @@ class HPCScheduler:
     Coordinates job scheduling, expansion, shrinking, and execution.
     """
 
-    def __init__(self, node_manager: Any, job_file: str, policy_file: str, dvm_file: str, evolving_job_requests_file: str, schedule_type: int) -> None:
+    def __init__(self, node_manager: Any, job_file: str, policy_file: str, dvm_file: str, evolving_job_requests_file: str, schedule_type: int, expand_strategy: str = "fcfs", shrink_strategy: str = "fcfs") -> None:
         self.node_manager = node_manager
         self.job_queue: Deque[JobRecord] = deque()
         self.running_jobs: List[JobRecord] = []
@@ -37,6 +37,8 @@ class HPCScheduler:
         self.pending_job_requests: Deque[JobRequest] = deque()
         self.schedule_type = schedule_type
         self.dvm_file = dvm_file
+        self.expand_strategy = expand_strategy
+        self.shrink_strategy = shrink_strategy
 
         self.lock = threading.Lock()
         self.cv = threading.Condition(self.lock)
@@ -212,13 +214,13 @@ class HPCScheduler:
         """Attempt to reduce resource fragmentation by expanding or shrinking jobs."""
         if self.schedule_type == 0:
             logger.info("Free nodes detected with running jobs. Attempting expansion.")
-            expanded = elastic_expand(self.running_jobs, available, self.node_manager, self.policy_file)
+            expanded = elastic_expand(self.running_jobs, available, self.node_manager, self.policy_file, strategy=self.expand_strategy)
             if expanded > 0:
                 self._notify()
         else:
             min_allocation_job = job.spec.min_nodes if job else 0
             logger.info("Free nodes detected with running jobs. Attempting shrinking.")
-            shrunk = elastic_shrink(self.running_jobs, min_allocation_job, self.node_manager, self.policy_file)
+            shrunk = elastic_shrink(self.running_jobs, min_allocation_job, self.node_manager, self.policy_file, strategy=self.shrink_strategy)
             if shrunk > 0:
                 self._notify()
     
@@ -229,34 +231,23 @@ class HPCScheduler:
         nodes_str = ",".join(rj.runtime.nodes)
         nodes_with_slots = ",".join(f"{n}:64" for n in rj.runtime.nodes)
         command = rj.command
+
         if "prun " in command:
             command = command.replace(
                 "prun ",
                 f"prun --dvm-uri file:{self.dvm_file} --host {nodes_with_slots} "
                 f"--map-by node --bind-to none -n {len(rj.nodes)} "
             )
-        # if "--nodelist " in command:
-        #     command = command.replace("--nodelist ", f"--nodelist {nodes_str} ")
-        #     command = command.replace("--job_id ", f"--job_id {rj.id} ")
-        #     command = command.replace("--nnodes ", f"--nnodes {len(rj.nodes)} ")
-        #     command = command.replace("--wt", f"--wt {rj.walltime}")  # fixed
         if "--nodelist " in rj.command:
             command = rj.command.replace("--nodelist ", "--nodelist {} ".format(nodes_str))
             command = command.replace("--job_id ", "--job_id {} ".format(rj.id))
             command = command.replace("--nnodes ", "--nnodes {} --minnodes {} --maxnodes {} ".format(len(rj.nodes), rj.min_nodes, rj.max_nodes))
             command = command.replace("--wt", "--wt {}".format(rj.walltime))
         if "-L" in command:
-            command = command.replace(
-                "-L", f"-L {nodes_str} -N {len(rj.nodes)} -J {rj.id} "
-            )
-        # if "NUM_NODES" in command:
-        #     command = command.replace(
-        #         "NUM_NODES_EXAMOL ",
-        #         f"NUM_NODES_EXAMOL={len(rj.nodes)} "
-        #         f"NODES_EXAMOL={nodes_str} "
-        #         f"JOB_ID_EXAMOL={rj.id} "
-        #         f"WALLTIME_EXAMOL={rj.walltime} "
-        #     )
+            command = command.replace("-L", "-L {} -N {} -J {} -mi {} -ma {}".format(nodes_with_slots, len(rj.nodes), rj.id, rj.min_nodes, rj.max_nodes))
+        if "NUM_NODES" in command:
+            command = command.replace("NUM_NODES_EXAMOL ", "NUM_NODES_EXAMOL={} NODES_EXAMOL={} JOB_ID_EXAMOL={} MIN_NODES_EXAMOL={} MAX_NODES_EXAMOL={} WALLTIME_EXAMOL={} ".format(len(rj.nodes), nodes_with_slots, rj.id, rj.min_nodes, rj.max_nodes, rj.walltime))
+
         return command
     
     def execute_job(self, rj: JobRecord) -> None:

@@ -35,6 +35,12 @@ def main() -> None:
     parser.add_argument("-p", "--policyfile", default="policy.json", help="File path to the policy file")
     parser.add_argument("-jr", "--jobrequestsfile", default='jobrequests.json', help="File path to the Job requests file")
     parser.add_argument("-s", "--schedule_type", type=int, default=0, help="Schedule Type")
+    parser.add_argument("-es", "--expand-strategy", type=str, default="fcfs",
+                       choices=["fcfs", "longest", "most_remaining", "priority", "most_scalable", "equal"],
+                       help="Strategy for selecting jobs to expand: fcfs, longest, priority, most_scalable, equal")
+    parser.add_argument("-ss", "--shrink-strategy", type=str, default="fcfs",
+                       choices=["fcfs", "shortest", "least_remaining", "priority", "most_nodes", "equal"],
+                       help="Strategy for selecting jobs to shrink: fcfs, shortest, priority, most_nodes, equal")
     args = parser.parse_args()
 
     hostfile_path = args.hostfile
@@ -43,6 +49,8 @@ def main() -> None:
     job_request_file = args.jobrequestsfile
     total_nodes = args.nnodes
     s_type = args.schedule_type
+    expand_strategy = args.expand_strategy
+    shrink_strategy = args.shrink_strategy
 
     test_directory = os.path.dirname(os.path.abspath(job_file_path))
     dvm_file_path = os.path.join(test_directory, "dvm.uri")
@@ -61,7 +69,7 @@ def main() -> None:
         logger.error(f"Failed to start process manager: {e}")
         return
 
-    scheduler = HPCScheduler(node_manager, job_file_path, policy_file_path, dvm_file_path, job_request_file, s_type)
+    scheduler = HPCScheduler(node_manager, job_file_path, policy_file_path, dvm_file_path, job_request_file, s_type, expand_strategy, shrink_strategy)
     job_monitor = JobMonitor(scheduler, job_file_path, job_request_file)
 
     # Start the scheduler and job monitoring in separate threads
