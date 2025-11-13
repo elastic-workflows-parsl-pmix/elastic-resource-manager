@@ -95,8 +95,18 @@ class HPCScheduler:
         """Try to schedule pending jobs from the queue."""
         logger.info(f"Scheduling attempt: {len(self.job_queue)} jobs in queue")
         logger.info(f"Attempting to schedule Job {job.id} (min_nodes={job.min_nodes}, max_nodes={job.max_nodes})")
+        
+        # First try with preferred allocation size based on schedule type
         req = job.spec.min_nodes if self.schedule_type == 0 else job.spec.max_nodes
+        logger.info(f"First attempt with {req} nodes (schedule_type={self.schedule_type})")
         allocated = self.node_manager.allocate_nodes(req)
+        
+        # If schedule_type is 1 and max_nodes allocation failed, try with min_nodes as fallback
+        if not allocated and self.schedule_type == 1 and job.spec.min_nodes < job.spec.max_nodes:
+            logger.info(f"Max nodes allocation failed, trying fallback with min_nodes={job.spec.min_nodes}")
+            req = job.spec.min_nodes
+            allocated = self.node_manager.allocate_nodes(req)
+        
         with self.cv:
             if allocated and self.job_queue and self.job_queue[0] is job:
                 self.job_queue.popleft()
@@ -108,8 +118,9 @@ class HPCScheduler:
                     name=f"Job-{job.spec.id}",
                     daemon=True,
                 ).start()
+                logger.info(f"Successfully scheduled Job {job.id} with {len(allocated)} nodes")
                 return True
-   
+
         return False
 
     def schedule_job_request(self, job_request: JobRequest) -> bool:
@@ -138,19 +149,19 @@ class HPCScheduler:
             if job and not job_request:
                 if self.schedule_pending_jobs(job):
                     logger.info(f"Scheduled Job {job.id} from queue.")
-                    # Don't return here - continue to check for expansion
+                    return  # Scheduled a job; no need to check requests
             elif job_request and not job:
                 if self.schedule_job_request(job_request):
                     logger.info(f"Scheduled Job Request {job_request.id}.")
                     return  # Evolving requests are immediate; no expansion after
             else:
                 # Prioritize job requests over queued jobs
-                if self.schedule_job_request(job_request):
+                if self.schedule_job_request(job_request) and self.schedule_type == 1:
                     logger.info(f"Scheduled Job Request {job_request.id}.")
                     return
                 if self.schedule_pending_jobs(job):
                     logger.info(f"Scheduled Job {job.id} from queue.")
-                    # Continue to expansion even if we scheduled a job
+                    return
 
             # If head job couldn't start, try backfill
             if job and len(self.job_queue) > 0:  # Head still exists
@@ -212,17 +223,21 @@ class HPCScheduler:
 
     def optimize_resource_fragmentation(self, available: int, job: JobRecord) -> None:
         """Attempt to reduce resource fragmentation by expanding or shrinking jobs."""
-        if self.schedule_type == 0:
-            logger.info("Free nodes detected with running jobs. Attempting expansion.")
-            expanded = elastic_expand(self.running_jobs, available, self.node_manager, self.policy_file, strategy=self.expand_strategy)
-            if expanded > 0:
-                self._notify()
-        else:
+        if self.schedule_type == 1:
             min_allocation_job = job.spec.min_nodes if job else 0
             logger.info("Free nodes detected with running jobs. Attempting shrinking.")
-            shrunk = elastic_shrink(self.running_jobs, min_allocation_job, self.node_manager, self.policy_file, strategy=self.shrink_strategy)
+            shrunk = elastic_shrink(self.running_jobs, min_allocation_job - available, self.node_manager, self.policy_file, strategy=self.shrink_strategy)
             if shrunk > 0:
+                logger.info(f"Successfully freed {shrunk} nodes, will retry scheduling")
                 self._notify()
+            else:
+                logger.info("Could not meet shrink requirement, keeping current allocation")
+        
+        # expand to fragmented free nodes
+        logger.info("Free nodes detected with running jobs. Attempting expansion.")
+        expanded = elastic_expand(self.running_jobs, available, self.node_manager, self.policy_file, strategy=self.expand_strategy)
+        if expanded > 0:
+            self._notify()
     
     # ------------ Job execution ------------
 
@@ -244,13 +259,13 @@ class HPCScheduler:
             command = command.replace("--nnodes ", "--nnodes {} --minnodes {} --maxnodes {} ".format(len(rj.nodes), rj.min_nodes, rj.max_nodes))
             command = command.replace("--wt", "--wt {}".format(rj.walltime))
         if "-L" in command:
-            command = command.replace("-L", "-L {} -N {} -J {} -mi {} -ma {}".format(nodes_with_slots, len(rj.nodes), rj.id, rj.min_nodes, rj.max_nodes))
+            command = command.replace("-L", "-L {} -N {} -J {} -mi {} -ma {}".format(nodes_str, len(rj.nodes), rj.id, rj.min_nodes, rj.max_nodes))
         if "NUM_NODES" in command:
             command = command.replace("NUM_NODES_EXAMOL ", "NUM_NODES_EXAMOL={} NODES_EXAMOL={} JOB_ID_EXAMOL={} MIN_NODES_EXAMOL={} MAX_NODES_EXAMOL={} WALLTIME_EXAMOL={} ".format(len(rj.nodes), nodes_with_slots, rj.id, rj.min_nodes, rj.max_nodes, rj.walltime))
 
         return command
     
-    def execute_job(self, rj: JobRecord) -> None:
+    def execute_job(self, rj: JobRecord, log_stderr: bool = False) -> None:
         """
         Execute a job and free nodes after completion. Updates job status in job_file.
         """
@@ -292,10 +307,18 @@ class HPCScheduler:
                 )
                 t_out.start()
                 threads.append(t_out)
-            if proc.stderr:
+            if proc.stderr and log_stderr:  # Only log stderr if the flag is True
                 t_err = threading.Thread(
                     target=_pump_stream,
                     args=(proc.stderr, lambda l: logger.error(f"[Job {rj.id}][stderr] {l}")),
+                    daemon=True,
+                )
+                t_err.start()
+                threads.append(t_err)
+            elif proc.stderr:  # Still read stderr to prevent subprocess from hanging
+                t_err = threading.Thread(
+                    target=_pump_stream,
+                    args=(proc.stderr, lambda l: None),  # Do nothing with the line
                     daemon=True,
                 )
                 t_err.start()
