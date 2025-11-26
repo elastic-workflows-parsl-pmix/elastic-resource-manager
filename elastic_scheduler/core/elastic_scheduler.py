@@ -13,44 +13,97 @@ from elastic_scheduler.jobs.job import JobRecord, JobRequest
 
 logger = logging.getLogger(__name__)
 
-
-# Add this new function to wait and free nodes in a background thread
-def _wait_and_free_nodes(policy_file: str, entry: Dict[str, Any], shrink_nodes: List[str], 
-                        node_manager: Any, job_id: Any, runtime_nodes: Any, 
-                        elastic_events: int, timeout: float = 600.0):
+def _wait_and_allocate_nodes(policy_file: str, entry: Dict[str, Any], expand_nodes: List[str], 
+                             job_id: Any, runtime_nodes: Any, elastic_events: int, 
+                             timeout: float = 600.0, expand_start_time: float = None):
     """
-    Wait in a background thread for policy to be applied, then free nodes.
+    Wait in a background thread for policy to be applied during expansion.
     This function runs in its own thread to avoid blocking the main scheduler.
     """
     try:
-        # Use an event for cancellation support
-        cancel_event = threading.Event()
-        
-        # Start time for logging
-        start_time = time.time()
-        last_log_time = start_time
+        # Track when this specific job's expansion starts waiting
+        wait_start_time = time.time()
+        last_log_time = wait_start_time
         
         # Wait until policy is applied or timeout occurs
+        cancel_event = threading.Event()
+        
         while not cancel_event.is_set():
             if not policy_entry_exists(policy_file, entry):
-                # Policy applied - free the nodes
-                node_manager.free_nodes(shrink_nodes)
+                # Policy applied
+                wait_duration = time.time() - wait_start_time
+                total_duration = time.time() - expand_start_time if expand_start_time else wait_duration
+                
                 logger.info(
-                    f"[Elastic Scaling] Job {job_id} -{len(shrink_nodes)} "
+                    f"[Elastic Scaling] Job {job_id} +{len(expand_nodes)} nodes "
                     f"(Now: {len(runtime_nodes)}). Events={elastic_events} "
-                    f"[Background thread completed after {time.time() - start_time:.1f}s]"
+                    f"[Wait: {wait_duration:.2f}s, Total: {total_duration:.2f}s]"
                 )
                 return
                 
             # Periodically log that we're still waiting
             current_time = time.time()
             if current_time - last_log_time >= 30.0:
-                logger.info(f"[Policy] Still waiting for shrink to apply for Job {job_id} "
-                          f"(nodes: {len(shrink_nodes)}, waiting: {current_time - start_time:.1f}s)")
+                elapsed = current_time - wait_start_time
+                logger.info(f"[Policy] Still waiting for expand to apply for Job {job_id} "
+                          f"(nodes: {len(expand_nodes)}, waiting: {elapsed:.1f}s)")
                 last_log_time = current_time
                 
             # Check for timeout
-            if timeout and (current_time - start_time) > timeout:
+            if timeout and (current_time - wait_start_time) > timeout:
+                logger.warning(
+                    f"[Policy] Expand for Job {job_id} not applied within {timeout}s timeout; "
+                    f"nodes may not be properly allocated: {entry['nodes']}."
+                )
+                return
+                
+            # Sleep briefly to avoid CPU spin
+            time.sleep(1.0)
+            
+    except Exception as e:
+        logger.error(f"[Policy] Error in background thread waiting for Job {job_id} expand: {e}")
+
+def _wait_and_free_nodes(policy_file: str, entry: Dict[str, Any], shrink_nodes: List[str], 
+                        node_manager: Any, job_id: Any, runtime_nodes: Any, 
+                        elastic_events: int, timeout: float = 600.0, shrink_start_time: float = None):
+    """
+    Wait in a background thread for policy to be applied, then free nodes.
+    This function runs in its own thread to avoid blocking the main scheduler.
+    """
+    try:
+        # Track when this specific job's shrink starts waiting
+        wait_start_time = time.time()
+        last_log_time = wait_start_time
+        
+        # Wait until policy is applied or timeout occurs
+        cancel_event = threading.Event()
+        
+        while not cancel_event.is_set():
+            if not policy_entry_exists(policy_file, entry):
+                # Policy applied - free the nodes
+                node_manager.free_nodes(shrink_nodes)
+                
+                # Calculate timings
+                wait_duration = time.time() - wait_start_time
+                total_duration = time.time() - shrink_start_time if shrink_start_time else wait_duration
+                
+                logger.info(
+                    f"[Elastic Scaling] Job {job_id} -{len(shrink_nodes)} nodes "
+                    f"(Now: {len(runtime_nodes)}). Events={elastic_events} "
+                    f"[Wait: {wait_duration:.2f}s, Total: {total_duration:.2f}s]"
+                )
+                return
+                
+            # Periodically log that we're still waiting
+            current_time = time.time()
+            if current_time - last_log_time >= 30.0:
+                elapsed = current_time - wait_start_time
+                logger.info(f"[Policy] Still waiting for shrink to apply for Job {job_id} "
+                          f"(nodes: {len(shrink_nodes)}, waiting: {elapsed:.1f}s)")
+                last_log_time = current_time
+                
+            # Check for timeout
+            if timeout and (current_time - wait_start_time) > timeout:
                 logger.warning(
                     f"[Policy] Shrink for Job {job_id} not applied within {timeout}s timeout; "
                     f"deferring free of nodes {entry['nodes']}."
@@ -342,13 +395,17 @@ def expand_elastic_jobs(
     else:
         return _expand_sequential(candidates, available_nodes, node_manager, policy_file)
 
+# Update _expand_sequential to include timing and background threads
 def _expand_sequential(candidates: List[JobRecord], available_nodes: int, node_manager: Any, policy_file: str) -> int:
-    """Expand jobs sequentially according to the provided order."""
+    """Expand jobs sequentially according to the provided order with timing."""
+    expand_start = time.time()
     expanded_total = 0
+    threads = []  # Track all threads
 
     for rj in candidates:
         now = time.time()
         cooldown = _get_cooldown_period(rj)
+        
         # Avoid rapid repeated expand attempts
         if rj.runtime.elastic_events and (now - rj.runtime.last_elastic_time < cooldown):
             logger.info(f"[Elastic Scaling] Skipping rapid expand attempt for Job {rj.id}. "
@@ -382,22 +439,47 @@ def _expand_sequential(candidates: List[JobRecord], available_nodes: int, node_m
         }
         update_policy_file(policy_file, entry)
 
+        # Launch background thread to wait for policy application
+        thread = threading.Thread(
+            target=_wait_and_allocate_nodes,
+            args=(policy_file, entry, new_nodes, rj.id, 
+                  rj.runtime.nodes, rj.runtime.elastic_events),
+            kwargs={"expand_start_time": expand_start},
+            daemon=True,
+            name=f"ExpandWaiter-{rj.id}"
+        )
+        thread.start()
+        threads.append((thread, rj.id, len(new_nodes)))
+
         expanded_total += len(new_nodes)
         logger.info(
             f"[Elastic Scaling] Job {rj.id} +{len(new_nodes)} "
-            f"(Now: {len(rj.runtime.nodes)}). Events={rj.runtime.elastic_events}"
+            f"(Now: {len(rj.runtime.nodes)}). Events={rj.runtime.elastic_events} "
+            f"[Thread started]"
         )
 
         if expanded_total >= available_nodes:
             break
 
+    expand_duration = time.time() - expand_start
+    
+    logger.info(
+        f"[Elastic Scaling] Expand complete. "
+        f"Allocated {expanded_total}/{available_nodes} nodes. "
+        f"Execution: {expand_duration:.3f}s. "
+        f"{len(threads)} background threads active."
+    )
+
     return expanded_total
 
+
 def _expand_equal_share(candidates: List[JobRecord], available_nodes: int, node_manager: Any, policy_file: str) -> int:
-    """Expand all jobs with equal distribution of nodes."""
+    """Expand all jobs with equal distribution of nodes and timing."""
     if not candidates or available_nodes <= 0:
         return 0
 
+    expand_start = time.time()
+    
     cooldown = _get_cooldown_period(candidates[0])
     if candidates[0].runtime.elastic_events and (time.time() - candidates[0].runtime.last_elastic_time < cooldown):
         logger.info(f"[Elastic Scaling] Skipping rapid expand attempt for Jobs {', '.join(str(j.id) for j in candidates)}.")
@@ -409,6 +491,7 @@ def _expand_equal_share(candidates: List[JobRecord], available_nodes: int, node_
         return 0
 
     expanded_total = 0
+    threads = []
     
     # First pass: calculate fair share
     fair_shares = {}
@@ -451,11 +534,33 @@ def _expand_equal_share(candidates: List[JobRecord], available_nodes: int, node_
         }
         update_policy_file(policy_file, entry)
 
+        # Launch background thread
+        thread = threading.Thread(
+            target=_wait_and_allocate_nodes,
+            args=(policy_file, entry, new_nodes, job.id, 
+                  job.runtime.nodes, job.runtime.elastic_events),
+            kwargs={"expand_start_time": expand_start},
+            daemon=True,
+            name=f"ExpandWaiter-{job.id}"
+        )
+        thread.start()
+        threads.append((thread, job.id, len(new_nodes)))
+
         expanded_total += len(new_nodes)
         logger.info(
             f"[Elastic Scaling] Job {job.id} +{len(new_nodes)} "
-            f"(Now: {len(job.runtime.nodes)}, fair share). Events={job.runtime.elastic_events}"
+            f"(Now: {len(job.runtime.nodes)}, fair share). Events={job.runtime.elastic_events} "
+            f"[Thread started]"
         )
+
+    expand_duration = time.time() - expand_start
+    
+    logger.info(
+        f"[Elastic Scaling] Equal-share expand complete. "
+        f"Allocated {expanded_total}/{available_nodes} nodes. "
+        f"Execution: {expand_duration:.3f}s. "
+        f"{len(threads)} background threads active."
+    )
 
     return expanded_total
 
@@ -510,11 +615,12 @@ def shrink_elastic_jobs(
         return _shrink_sequential(candidates, required_nodes, node_manager, policy_file)
 
 def _shrink_sequential(candidates: List[JobRecord], required_nodes: int, node_manager: Any, policy_file: str) -> int:
-    """Shrink jobs sequentially according to the provided order, with validation phase."""
+    """Shrink jobs sequentially according to the provided order, with validation phase and timing."""
     
     # Phase 1: Validation - Check if we can meet requirements without actually shrinking
+    validation_start = time.time()
     freed_total = 0
-    shrink_plan = []  # List of (job, shrink_nodes) tuples
+    shrink_plan = []  # List of (job, shrink_nodes, shrink_num) tuples
     
     for rj in candidates:
         if freed_total >= required_nodes:
@@ -553,23 +659,27 @@ def _shrink_sequential(candidates: List[JobRecord], required_nodes: int, node_ma
         
         logger.info(f"[Elastic Scaling][Validation] Job {rj.id} can provide {shrink_num} nodes")
 
+    validation_duration = time.time() - validation_start
+
     # Check if we can meet the requirement
     if freed_total < required_nodes:
         logger.warning(
             f"[Elastic Scaling][Validation] Cannot meet requirement. "
             f"Need {required_nodes} nodes, can only free {freed_total} nodes. "
-            f"Aborting shrink operation."
+            f"Validation took {validation_duration:.3f}s. Aborting shrink operation."
         )
         return 0
     
     logger.info(
-        f"[Elastic Scaling][Validation] Validation passed. "
+        f"[Elastic Scaling][Validation] Validation passed in {validation_duration:.3f}s. "
         f"Can free {freed_total}/{required_nodes} nodes from {len(shrink_plan)} jobs. "
         f"Proceeding with shrink."
     )
     
     # Phase 2: Execution - Actually perform the shrinking
+    execution_start = time.time()
     actual_freed = 0
+    threads = []  # Track all threads
     
     for rj, potential_shrink, shrink_num in shrink_plan:
         # Double-check conditions haven't changed
@@ -595,34 +705,50 @@ def _shrink_sequential(candidates: List[JobRecord], required_nodes: int, node_ma
         update_policy_file(policy_file, entry)
 
         # Launch background thread to wait for policy application and free nodes
-        logger.info(f"[Elastic Scaling][Execution] Started background thread for Job {rj.id} shrink")
         thread = threading.Thread(
             target=_wait_and_free_nodes,
             args=(policy_file, entry, shrink_nodes, node_manager, rj.id, 
                   rj.runtime.nodes, rj.runtime.elastic_events),
+            kwargs={"shrink_start_time": execution_start},
             daemon=True,
             name=f"ShrinkWaiter-{rj.id}"
         )
         thread.start()
+        threads.append((thread, rj.id, len(shrink_nodes)))
         
         actual_freed += len(shrink_nodes)
         
         logger.info(
             f"[Elastic Scaling][Execution] Job {rj.id} -{len(shrink_nodes)} nodes "
-            f"(Now: {len(rj.runtime.nodes)}). Events={rj.runtime.elastic_events}"
+            f"(Now: {len(rj.runtime.nodes)}). Events={rj.runtime.elastic_events} "
+            f"[Thread started]"
         )
         
         if actual_freed >= required_nodes:
             break
 
-    logger.info(f"[Elastic Scaling] Shrink complete. Freed {actual_freed}/{required_nodes} nodes")
+    execution_duration = time.time() - execution_start
+    
+    # Log summary with timing breakdown
+    logger.info(
+        f"[Elastic Scaling] Shrink complete. "
+        f"Freed {actual_freed}/{required_nodes} nodes. "
+        f"Validation: {validation_duration:.3f}s, Execution: {execution_duration:.3f}s, "
+        f"Total: {validation_duration + execution_duration:.3f}s. "
+        f"{len(threads)} background threads active."
+    )
+    
     return actual_freed
 
+
+# Update _shrink_equal_share to include validation and execution timing
 def _shrink_equal_share(candidates: List[JobRecord], required_nodes: int, node_manager: Any, policy_file: str) -> int:
-    """Shrink all jobs proportionally with validation phase."""
+    """Shrink all jobs proportionally with validation phase and timing."""
     if not candidates or required_nodes <= 0:
         return 0
 
+    validation_start = time.time()
+    
     cooldown = _get_cooldown_period(candidates[0])
     if candidates[0].runtime.elastic_events and (time.time() - candidates[0].runtime.last_elastic_time < cooldown):
         logger.info(f"[Elastic Scaling] Skipping rapid shrink attempt - in cooldown ({cooldown:.1f}s)")
@@ -641,10 +767,11 @@ def _shrink_equal_share(candidates: List[JobRecord], required_nodes: int, node_m
         return 0
     
     if total_extra_nodes < required_nodes:
+        validation_duration = time.time() - validation_start
         logger.warning(
             f"[Elastic Scaling][Validation] Cannot meet requirement. "
             f"Need {required_nodes} nodes, only {total_extra_nodes} shrinkable nodes available. "
-            f"Aborting shrink operation."
+            f"Validation took {validation_duration:.3f}s. Aborting shrink operation."
         )
         return 0
     
@@ -670,22 +797,26 @@ def _shrink_equal_share(candidates: List[JobRecord], required_nodes: int, node_m
             total_planned += job_shrink
             logger.info(f"[Elastic Scaling][Validation] Job {job.id} can provide {job_shrink} nodes (proportional)")
     
+    validation_duration = time.time() - validation_start
+    
     if total_planned < required_nodes:
         logger.warning(
             f"[Elastic Scaling][Validation] Proportional distribution insufficient. "
             f"Need {required_nodes} nodes, can only free {total_planned} nodes. "
-            f"Aborting shrink operation."
+            f"Validation took {validation_duration:.3f}s. Aborting shrink operation."
         )
         return 0
     
     logger.info(
-        f"[Elastic Scaling][Validation] Validation passed. "
+        f"[Elastic Scaling][Validation] Validation passed in {validation_duration:.3f}s. "
         f"Can free {total_planned}/{required_nodes} nodes from {len(shrink_plan)} jobs proportionally. "
         f"Proceeding with shrink."
     )
     
     # Phase 2: Execution - Actually perform the shrinking
+    execution_start = time.time()
     actual_freed = 0
+    threads = []
     
     for job, potential_shrink, shrink_num in shrink_plan:
         # Double-check conditions
@@ -711,28 +842,40 @@ def _shrink_equal_share(candidates: List[JobRecord], required_nodes: int, node_m
         update_policy_file(policy_file, entry)
 
         # Launch background thread
-        logger.info(f"[Elastic Scaling][Execution] Started background thread for Job {job.id} proportional shrink")
         thread = threading.Thread(
             target=_wait_and_free_nodes,
             args=(policy_file, entry, shrink_nodes, node_manager, job.id, 
                   job.runtime.nodes, job.runtime.elastic_events),
+            kwargs={"shrink_start_time": execution_start},
             daemon=True,
             name=f"ShrinkWaiter-{job.id}"
         )
         thread.start()
+        threads.append((thread, job.id, len(shrink_nodes)))
 
         actual_freed += len(shrink_nodes)
         
         logger.info(
             f"[Elastic Scaling][Execution] Job {job.id} -{len(shrink_nodes)} nodes "
-            f"(Now: {len(job.runtime.nodes)}, proportional). Events={job.runtime.elastic_events}"
+            f"(Now: {len(job.runtime.nodes)}, proportional). Events={job.runtime.elastic_events} "
+            f"[Thread started]"
         )
 
         if actual_freed >= required_nodes:
             break
 
-    logger.info(f"[Elastic Scaling] Proportional shrink complete. Freed {actual_freed}/{required_nodes} nodes")
+    execution_duration = time.time() - execution_start
+
+    logger.info(
+        f"[Elastic Scaling] Proportional shrink complete. "
+        f"Freed {actual_freed}/{required_nodes} nodes. "
+        f"Validation: {validation_duration:.3f}s, Execution: {execution_duration:.3f}s, "
+        f"Total: {validation_duration + execution_duration:.3f}s. "
+        f"{len(threads)} background threads active."
+    )
+    
     return actual_freed
+
 
 def handle_evolving_job_requests(
      job_request: JobRequest,
