@@ -7,25 +7,39 @@ import subprocess
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Deque, Dict, List, Any
+from typing import Deque, Dict, List, Any, Optional
 
 from elastic_scheduler.jobs.job import JobRecord, JobStatus, JobRequest
 from elastic_scheduler.core.elastic_scheduler import (
     expand_elastic_jobs as elastic_expand,
+    mark_incomplete_phases_on_completion,
     shrink_elastic_jobs as elastic_shrink,
     handle_evolving_job_requests as handle_evolving
 )
 
 logger = logging.getLogger(__name__)
 
+@dataclass
+class Reservation:
+    """A reservation of nodes for a pending job."""
+    job_id: str
+    nodes_needed: int
+    nodes_reserved: int  # nodes we expect from shrinking
+    created_at: float = field(default_factory=time.time)
+    shrink_issued: bool = False
+    expires_at: float = field(default_factory=lambda: time.time() + 300)  # 5 min timeout
+    
+    def is_expired(self) -> bool:
+        return time.time() > self.expires_at
 
 class HPCScheduler:
     """
     Coordinates job scheduling, expansion, shrinking, and execution.
     """
 
-    def __init__(self, node_manager: Any, job_file: str, policy_file: str, dvm_file: str, evolving_job_requests_file: str, schedule_type: int, expand_strategy: str = "fcfs", shrink_strategy: str = "fcfs") -> None:
+    def __init__(self, node_manager: Any, job_file: str, policy_file: str, dvm_file: str, evolving_job_requests_file: str, schedule_type: int, expand_strategy: str = "fcfs", shrink_strategy: str = "fcfs", scheduling_mode: str = "rigid") -> None:
         self.node_manager = node_manager
         self.job_queue: Deque[JobRecord] = deque()
         self.running_jobs: List[JobRecord] = []
@@ -39,11 +53,20 @@ class HPCScheduler:
         self.dvm_file = dvm_file
         self.expand_strategy = expand_strategy
         self.shrink_strategy = shrink_strategy
+        # Scheduling mode: "rigid", "evolving", "scheduler_driven"
+        self.scheduling_mode = scheduling_mode
 
         self.lock = threading.Lock()
         self.cv = threading.Condition(self.lock)
 
+        self.reservations: Dict[str, Reservation] = {}  # job_id -> Reservation
+
+
     # ------------ Public API ------------
+    
+    def available_nodes(self) -> int:
+        """Get available nodes from node manager."""
+        return len(self.node_manager.read_hostfile())
 
     def submit_job(self, job: JobRecord) -> str:
         """Submit a job, stamp arrival_time, enqueue, notify, and return job_id."""
@@ -66,6 +89,43 @@ class HPCScheduler:
         t = threading.Thread(target=self._run_loop, name="HPCScheduler", daemon=True)
         t.start()
 
+    # ------------ Reservation helpers ------------
+
+    def _get_reservation(self, job_id: str) -> Optional[Reservation]:
+        """Get existing reservation for a job, removing if expired."""
+        res = self.reservations.get(job_id)
+        if res and res.is_expired():
+            logger.info(f"[Reservation] Reservation for job {job_id} expired, removing.")
+            del self.reservations[job_id]
+            return None
+        return res
+
+    def _create_reservation(self, job: JobRecord, nodes_needed: int, nodes_from_shrink: int) -> Reservation:
+        """Create a new reservation for a job waiting on shrink."""
+        res = Reservation(
+            job_id=job.id,
+            nodes_needed=nodes_needed,
+            nodes_reserved=nodes_from_shrink,
+            shrink_issued=True
+        )
+        self.reservations[job.id] = res
+        logger.info(f"[Reservation] Created reservation for job {job.id}: "
+                   f"needs={nodes_needed}, expecting={nodes_from_shrink} from shrink")
+        return res
+
+    def _clear_reservation(self, job_id: str) -> None:
+        """Clear reservation when job starts or is cancelled."""
+        if job_id in self.reservations:
+            del self.reservations[job_id]
+            logger.info(f"[Reservation] Cleared reservation for job {job_id}")
+
+    def _cleanup_expired_reservations(self) -> None:
+        """Remove any expired reservations."""
+        expired = [jid for jid, res in self.reservations.items() if res.is_expired()]
+        for jid in expired:
+            del self.reservations[jid]
+            logger.info(f"[Reservation] Expired reservation for job {jid}")
+
     # ------------ Main loop ------------
 
     def _run_loop(self) -> None:
@@ -87,6 +147,7 @@ class HPCScheduler:
                     self.cv.wait(timeout=1.0)
 
             try:
+                self._cleanup_expired_reservations()
                 self._attempt_scheduling()
             except Exception as e:
                 logger.exception(f"Scheduling iteration failed: {e}")
@@ -110,6 +171,8 @@ class HPCScheduler:
         with self.cv:
             if allocated and self.job_queue and self.job_queue[0] is job:
                 self.job_queue.popleft()
+                # Clear any reservation since job is starting
+                self._clear_reservation(job.id)
                 job.start(allocated)
                 self.running_jobs.append(job)
                 threading.Thread(
@@ -134,7 +197,7 @@ class HPCScheduler:
         if not job_record:
             logger.info(f"Evolving request for unknown/finished job {job_id}; discarding.")
             return False
-        handle_evolving(job_request, job_record, self._available_nodes(), self.node_manager, self.policy_file, self.evolving_job_requests_file)
+        handle_evolving(job_request, job_record, self.available_nodes(), self.node_manager, self.policy_file, self.evolving_job_requests_file)
         return True
 
     def _attempt_scheduling(self) -> None:
@@ -144,34 +207,115 @@ class HPCScheduler:
             job = self.job_queue[0] if self.job_queue else None
             job_request = self.pending_job_requests[0] if self.pending_job_requests else None
 
-        # 1) Handle pending work first (jobs and requests)
-        if job or job_request:
-            if job and not job_request:
+        # === MODE: RIGID ===
+        # Only schedule jobs, no elastic operations
+        if self.scheduling_mode == "rigid":
+            if job:
                 if self.schedule_pending_jobs(job):
-                    logger.info(f"Scheduled Job {job.id} from queue.")
-                    return  # Scheduled a job; no need to check requests
-            elif job_request and not job:
+                    logger.info(f"[Rigid] Scheduled Job {job.id} from queue.")
+                    return
+                # Try backfill if head job couldn't start
+                if len(self.job_queue) > 0:
+                    self.backfill_jobs()
+            return
+
+        # === MODE: EVOLVING ===
+        # Schedule jobs + only honor application-driven requests (no scheduler-initiated scaling)
+        if self.scheduling_mode == "evolving":
+            # Process evolving job requests first (application-driven)
+            if job_request:
                 if self.schedule_job_request(job_request):
-                    logger.info(f"Scheduled Job Request {job_request.id}.")
-                    return  # Evolving requests are immediate; no expansion after
-            else:
-                # Prioritize job requests over queued jobs
-                if self.schedule_job_request(job_request) and self.schedule_type == 1:
-                    logger.info(f"Scheduled Job Request {job_request.id}.")
+                    logger.info(f"[Evolving] Processed evolving request {job_request.id}.")
                     return
+
+            # Then try to schedule pending jobs
+            if job:
                 if self.schedule_pending_jobs(job):
-                    logger.info(f"Scheduled Job {job.id} from queue.")
+                    logger.info(f"[Evolving] Scheduled Job {job.id} from queue.")
+                    return
+                # Try backfill if head job couldn't start
+                if len(self.job_queue) > 0:
+                    self.backfill_jobs()
+            return
+
+        # === MODE: SCHEDULER_DRIVEN ===
+        # Full scheduler control: shrink victims to fit jobs, expand when idle nodes exist
+        if self.scheduling_mode == "scheduler_driven":
+            # 1) Process evolving requests if any (still honor app requests)
+            if job_request:
+                if self.schedule_job_request(job_request):
+                    logger.info(f"[Scheduler-Driven] Processed evolving request {job_request.id}.")
                     return
 
-            # If head job couldn't start, try backfill
-            if job and len(self.job_queue) > 0:  # Head still exists
-                self.backfill_jobs()
+            # 2) Try to schedule pending job directly
+            if job:
+                if self.schedule_pending_jobs(job):
+                    logger.info(f"[Scheduler-Driven] Scheduled Job {job.id} from queue.")
+                    return
 
-        # 2) Always check for elastic opportunities when nodes are free
-        available = self._available_nodes()
-        if available > 0 and len(self.running_jobs) > 0:
-            logger.info(f"Free nodes available ({available}), attempting elastic optimization.")
-            self.optimize_resource_fragmentation(available, job)
+                # 3) If job couldn't start, try shrinking running jobs to make room
+                available = self.available_nodes()
+                required = (job.spec.min_nodes if self.schedule_type == 0 else job.spec.max_nodes)
+                shortfall = required - available
+
+                # if shortfall > 0 and available > 0:
+                if shortfall > 0:
+                    # Check if we already have a pending shrink for this job
+                    existing_res = self._get_reservation(job.id)
+
+                    if existing_res and existing_res.shrink_issued:
+                        logger.info(f"[Scheduler-Driven] Existing shrink reservation for Job {job.id} in place; waiting.")
+                        return
+                    
+                    logger.info(f"[Scheduler-Driven] Job {job.id} needs {required} nodes, "
+                               f"available={available}, shortfall={shortfall}. Attempting shrink.")
+                    
+                    shrunk = elastic_shrink(
+                        self.running_jobs, shortfall, self.node_manager, 
+                        self.policy_file, strategy=self.shrink_strategy
+                    )
+                    if shrunk > 0:
+                        self._create_reservation(job, required, shrunk)
+                        logger.info(f"[Scheduler-Driven] Issued shrink for {shrunk} nodes. "
+                                       f"Job {job.id} will start when nodes are released.")
+                        return
+                    else:
+                        # 3b) Could not shrink enough, but if there are idle nodes, 
+                        # expand running jobs to reduce fragmentation
+                        logger.info(f"[Scheduler-Driven] Could not shrink enough nodes for Job {job.id}.")
+                        if available > 0 and len(self.running_jobs) > 0:
+                            logger.info(f"[Scheduler-Driven] {available} idle nodes exist but can't fit pending job. "
+                                       f"Expanding running jobs to reduce fragmentation.")
+                            expanded = elastic_expand(
+                                self.running_jobs, available, self.node_manager, 
+                                self.policy_file, strategy=self.expand_strategy
+                            )
+                            if expanded > 0:
+                                logger.info(f"[Scheduler-Driven] Expanded running jobs by {expanded} nodes to reduce fragmentation.")
+                                return
+                # 4) Try backfill if head job still can't start
+                if len(self.job_queue) > 0 and available > 0:
+                    self.backfill_jobs()
+
+            # 5) If no pending jobs or after scheduling, expand running jobs with idle nodes
+            available = self.available_nodes()
+            has_pending_reservation = any(
+                res.shrink_issued and not res.is_expired() 
+                for res in self.reservations.values()
+            )
+            if available > 0 and len(self.running_jobs) > 0 and not has_pending_reservation:
+                logger.info(f"[Scheduler-Driven] {available} idle nodes available. Attempting expansion.")
+                expanded = elastic_expand(
+                    self.running_jobs, available, self.node_manager, 
+                    self.policy_file, strategy=self.expand_strategy
+                )
+                if expanded > 0:
+                    logger.info(f"[Scheduler-Driven] Expanded running jobs by {expanded} nodes.")
+            elif has_pending_reservation:
+                logger.info(f"[Scheduler-Driven] {available} idle nodes available but reserved for pending job.")
+            return
+
+        logger.warning(f"Unknown scheduling_mode '{self.scheduling_mode}', using default behavior.")
 
     def backfill_jobs(self) -> None:
         # --- Backfilling: try to run a smaller job without delaying the head job ---
@@ -181,7 +325,7 @@ class HPCScheduler:
             running_snapshot = list(self.running_jobs)
         if queue_snapshot:
             head = queue_snapshot[0]
-            available_now = self._available_nodes()
+            available_now = self.available_nodes()
             if available_now > 0:
                 t_res = self._reserve_time_for_head(head, available_now, running_snapshot)
                 now = time.time()
@@ -220,24 +364,6 @@ class HPCScheduler:
                         else:
                             # Candidate disappeared; return nodes
                             self.node_manager.free_nodes(bf_nodes)
-
-    def optimize_resource_fragmentation(self, available: int, job: JobRecord) -> None:
-        """Attempt to reduce resource fragmentation by expanding or shrinking jobs."""
-        if self.schedule_type == 1:
-            min_allocation_job = job.spec.min_nodes if job else 0
-            logger.info("Free nodes detected with running jobs. Attempting shrinking.")
-            shrunk = elastic_shrink(self.running_jobs, min_allocation_job - available, self.node_manager, self.policy_file, strategy=self.shrink_strategy)
-            if shrunk > 0:
-                logger.info(f"Successfully freed {shrunk} nodes, will retry scheduling")
-                self._notify()
-            else:
-                logger.info("Could not meet shrink requirement, keeping current allocation")
-        
-        # expand to fragmented free nodes
-        logger.info("Free nodes detected with running jobs. Attempting expansion.")
-        expanded = elastic_expand(self.running_jobs, available, self.node_manager, self.policy_file, strategy=self.expand_strategy)
-        if expanded > 0:
-            self._notify()
     
     # ------------ Job execution ------------
 
@@ -261,7 +387,7 @@ class HPCScheduler:
         if "-L" in command:
             command = command.replace("-L", "-L {} -N {} -J {} -mi {} -ma {}".format(nodes_str, len(rj.nodes), rj.id, rj.min_nodes, rj.max_nodes))
         if "NUM_NODES" in command:
-            command = command.replace("NUM_NODES_EXAMOL ", "NUM_NODES_EXAMOL={} NODES_EXAMOL={} JOB_ID_EXAMOL={} MIN_NODES_EXAMOL={} MAX_NODES_EXAMOL={} WALLTIME_EXAMOL={} ".format(len(rj.nodes), nodes_with_slots, rj.id, rj.min_nodes, rj.max_nodes, rj.walltime))
+            command = command.replace("NUM_NODES_EXAMOL ", "NUM_NODES_EXAMOL={} NODES_EXAMOL={} JOB_ID_EXAMOL={} MIN_NODES_EXAMOL={} MAX_NODES_EXAMOL={} WALLTIME_EXAMOL={} ".format(len(rj.nodes), nodes_str, rj.id, rj.min_nodes, rj.max_nodes, rj.walltime))
 
         return command
     
@@ -330,18 +456,18 @@ class HPCScheduler:
 
             if rc == 0:
                 self.update_job_status(rj.command, "completed")
+                mark_incomplete_phases_on_completion(rj)
                 logger.info(f"Job {rj.id} completed successfully.")
                 rj.complete(True)
             else:
                 logger.error(f"Job {rj.id} failed with code {rc}.")
+                mark_incomplete_phases_on_completion(rj, success=False)
                 self.update_job_status(rj.command, "failed")
                 rj.complete(False)
 
         except Exception as e:
             logger.exception(f"Error executing job {rj.id}: {e}")
-
-        nodes_to_free = list(rj.nodes)  # snapshot
-        self.node_manager.free_nodes(nodes_to_free)
+            rj.complete(False)
 
         duration = time.time() - start if 'start' in locals() else 0.0
         last_el = (
@@ -358,23 +484,66 @@ class HPCScheduler:
         except Exception as e:
             logger.error(f"Failed to append completed job: {e}")
         
+        nodes_to_free = list(rj.nodes)  # snapshot
+        self.node_manager.free_nodes(nodes_to_free)
         self._notify()
 
     def _serialize_completed_job(self, rj: JobRecord) -> Dict[str, Any]:
+        """Serialize completed job with full elastic phase details."""
+        # Get phase summary and detailed phase data
+        phase_summary = rj.runtime.get_phase_summary()
+        phases = [p.to_dict() for p in rj.runtime.elastic_phases]
+        
+        # Calculate total scaling overhead (time spent in scaling operations)
+        total_scaling_overhead = sum(
+            p.scaling_duration or 0 for p in rj.runtime.elastic_phases 
+            if p.operation != "initial"
+        )
+        
+        # Calculate node-hours for analysis
+        total_node_seconds = 0
+        for phase in rj.runtime.elastic_phases:
+            if phase.phase_duration and phase.nodes_after:
+                total_node_seconds += phase.phase_duration * phase.nodes_after
+        
         return {
+            # Basic job info
             "id": rj.id,
             "status": rj.status.value,
             "min_nodes": rj.min_nodes,
             "max_nodes": rj.max_nodes,
-            "walltime": rj.walltime,  # fixed
+            "walltime": rj.walltime,
             "command": rj.command,
+            
+            # Timing info
             "arrival_time": rj.runtime.arrival_time,
             "start_time": rj.runtime.start_time,
             "completion_time": rj.runtime.completion_time,
-            "elastic_events": rj.runtime.elastic_events,
-            "last_elastic_time": rj.runtime.last_elastic_time,
+            "total_runtime": (
+                rj.runtime.completion_time - rj.runtime.start_time
+                if rj.runtime.completion_time and rj.runtime.start_time else None
+            ),
+            "wait_time": (
+                rj.runtime.start_time - rj.runtime.arrival_time
+                if rj.runtime.start_time and rj.runtime.arrival_time else None
+            ),
+            
+            # Node info
+            "initial_nodes": phases[0]["nodes_after"] if phases else len(rj.nodes),
             "final_node_count": len(rj.nodes),
             "final_nodes": list(rj.nodes),
+            
+            # Elastic scaling summary
+            "elastic_events": rj.runtime.elastic_events,
+            "last_elastic_time": rj.runtime.last_elastic_time,
+            "total_scaling_overhead": total_scaling_overhead,
+            "total_node_seconds": total_node_seconds,
+            
+            # Phase summary statistics
+            "phase_summary": phase_summary,
+            
+            # Detailed phase history
+            "phases": phases,
         }
 
     # ------------ Helpers ------------
@@ -407,17 +576,11 @@ class HPCScheduler:
             f.flush()
             os.fsync(f.fileno())
 
-    def _available_nodes(self) -> int:
-        try:
-            return len(self.node_manager.read_hostfile())
-        except Exception as e:
-            logger.error(f"Failed to read hostfile: {e}")
-            return 0
 
     def _notify(self) -> None:
         """Notify the scheduler loop of new work/resources."""
         with self.cv:
-            logger.info(f"Notifying scheduler - queue:{len(self.job_queue)}, nodes:{self._available_nodes()}")
+            logger.info(f"Notifying scheduler - queue:{len(self.job_queue)}, nodes:{self.available_nodes()}")
             self.cv.notify_all()
 
     def _walltime_seconds(self, wt: str | None) -> int:

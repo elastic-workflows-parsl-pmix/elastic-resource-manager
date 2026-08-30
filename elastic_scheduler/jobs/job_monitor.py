@@ -3,6 +3,8 @@ import logging
 import os
 import threading
 import time
+import fcntl
+
 from typing import Set, Optional
 from elastic_scheduler.jobs import job_id_manager
 from watchdog.observers import Observer
@@ -73,6 +75,8 @@ class JobMonitor:
         self.observer: Optional[Observer] = None
         self.lock = threading.Lock()
         self._evolving_thread: Optional[threading.Thread] = None  # NEW
+        self._pending_jobs_thread: Optional[threading.Thread] = None
+        self.pending_poll_seconds = 2  # Polling interval for pending jobs with start_time
 
     
     def process_job_file(self) -> None:
@@ -92,6 +96,7 @@ class JobMonitor:
                     updated = False
 
                     for job_dict in job_data:
+
                         if "id" not in job_dict:
                             # Assign a new ID if not present
                             job_dict["id"] = str(job_id_manager.get_next_id())
@@ -100,6 +105,12 @@ class JobMonitor:
                         
                         # Check if the job is pending and ready to start
                         if (job_dict.get("status") == "pending" and job_id not in self.known_jobs):
+                            
+                            # Check start_time: only submit if elapsed time >= start_time
+                            start_time = job_dict.get("start_time", 0)
+                            elapsed = time.time() - self.start_time
+                            if elapsed < start_time:
+                                continue  # Not yet time to submit this job
                             
                             try:
                                 spec = JobSpec.from_dict(job_dict)
@@ -154,12 +165,47 @@ class JobMonitor:
                     daemon=True,
                 )
                 self._evolving_thread.start()
-                logger.info(f"Started monitoring evolving job requests: {self.evolving_job_requests_file}")
+            
+            # START pending jobs polling thread to check for jobs with start_time
+            if self._pending_jobs_thread is None or not self._pending_jobs_thread.is_alive():
+                self._pending_jobs_thread = threading.Thread(
+                    target=self._poll_pending_jobs,
+                    name="pending-jobs-poller",
+                    daemon=True,
+                )
+                self._pending_jobs_thread.start()
             
         except Exception as e:
             logger.error(f"Error starting job monitor: {e}")
             # Fall back to polling if file watching fails
             self._start_polling_fallback()
+
+    def _poll_pending_jobs(self) -> None:
+        """Poll for pending jobs with start_time that are now ready to submit."""
+        logger.info("Started polling for pending jobs with start_time")
+        while True:
+            time.sleep(self.pending_poll_seconds)
+            # Check if there are any pending jobs left
+            if not self._has_pending_jobs():
+                logger.info("No more pending jobs to submit, stopping pending jobs poller")
+                break
+            self.process_job_file()
+    
+    def _has_pending_jobs(self) -> bool:
+        """Check if there are any pending jobs in the job file."""
+        if not os.path.exists(self.job_file):
+            return False
+        try:
+            with open(self.job_file, "r") as file:
+                job_data = json.load(file)
+                if not isinstance(job_data, list):
+                    return False
+                for job_dict in job_data:
+                    if job_dict.get("status") == "pending":
+                        return True
+        except Exception:
+            pass
+        return False
 
     def monitor_evolving_job_requests(self):
         """Parses incoming JSON requests and adds them to the pending list."""
@@ -174,51 +220,69 @@ class JobMonitor:
             if not os.path.exists(self.evolving_job_requests_file):
                 continue
 
-            try:
-                with self.lock, open(self.evolving_job_requests_file, "r+", encoding="utf-8") as file:
-                    try:
-                        data = json.load(file)
-                    except json.JSONDecodeError as e:
-                        logger.error(f"Invalid JSON in evolving job requests file: {e}")
-                        continue
-
-                    requests = data.get("job_requests", [])
-                    if not isinstance(requests, list):
-                        logger.error("Invalid format: 'job_requests' must be a list.")
-                        continue
-
-                    updated = False
-                    for req in requests:
-                        status = str(req.get("status", "")).lower()
-                        job_id = str(req.get("job_id", ""))
-                        scale = str(req.get("scale", "")).lower()
-                        num_nodes = req.get("num_nodes")
-
-                        # Only submit pending, well-formed requests
-                        if status != "pending":
-                            continue
-                        if not job_id or scale not in ("expand", "shrink") or not isinstance(num_nodes, int) or num_nodes <= 0:
-                            logger.warning(f"Skipping malformed request: {req}")
-                            continue
-
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    with open(self.evolving_job_requests_file, "r+", encoding="utf-8") as file:
+                        # Use file lock to coordinate with elastic_scheduler.py
+                        fcntl.flock(file, fcntl.LOCK_EX)
                         try:
-                            job_request = JobRequest.from_dict(req)
-                            self.scheduler.submit_evolving_job_requests(job_request)
-                            logger.info(
-                                f"Evolving request submitted: job_id={job_id}, scale={scale}, num_nodes={num_nodes}, req_id={job_request.id}"
-                            )
-                            # Mark to prevent duplicate submission
-                            req["status"] = "arbitrating"
-                            updated = True
-                        except Exception as e:
-                            logger.error(f"Failed submitting evolving request for job {job_id}: {e}")
+                            content = file.read()
+                            if not content.strip():
+                                # File is empty, skip this iteration
+                                break
+                            data = json.loads(content)
 
-                    if updated:
-                        file.seek(0)
-                        json.dump(data, file, indent=4)
-                        file.truncate()
-            except Exception as e:
-                logger.error(f"Error handling evolving job requests: {e}")
+                            requests = data.get("job_requests", [])
+                            if not isinstance(requests, list):
+                                logger.error("Invalid format: 'job_requests' must be a list.")
+                                break
+
+                            updated = False
+                            for req in requests:
+                                status = str(req.get("status", "")).lower()
+                                job_id = str(req.get("job_id", ""))
+                                scale = str(req.get("scale", "")).lower()
+                                num_nodes = req.get("num_nodes")
+
+                                # Only submit pending, well-formed requests
+                                if status != "pending":
+                                    continue
+                                if not job_id or scale not in ("expand", "shrink") or not isinstance(num_nodes, int) or num_nodes <= 0:
+                                    logger.warning(f"Skipping malformed request: {req}")
+                                    continue
+
+                                try:
+                                    job_request = JobRequest.from_dict(req)
+                                    self.scheduler.submit_evolving_job_requests(job_request)
+                                    logger.info(
+                                        f"Evolving request submitted: job_id={job_id}, scale={scale}, num_nodes={num_nodes}, req_id={job_request.id}"
+                                    )
+                                    # Mark to prevent duplicate submission
+                                    req["status"] = "arbitrating"
+                                    updated = True
+                                except Exception as e:
+                                    logger.error(f"Failed submitting evolving request for job {job_id}: {e}")
+
+                            if updated:
+                                file.seek(0)
+                                file.truncate()
+                                json.dump(data, file, indent=4)
+                                file.flush()
+                                os.fsync(file.fileno())
+                        finally:
+                            fcntl.flock(file, fcntl.LOCK_UN)
+                        break  # Success, exit retry loop
+                        
+                except json.JSONDecodeError as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"JSON decode error (attempt {attempt + 1}/{max_retries}), retrying: {e}")
+                        time.sleep(0.1)
+                        continue
+                    logger.error(f"Invalid JSON in evolving job requests file: {e}")
+                except Exception as e:
+                    logger.error(f"Error handling evolving job requests: {e}")
+                    break
     
     def _start_polling_fallback(self) -> None:
         """Fall back to polling if file watching is not available."""

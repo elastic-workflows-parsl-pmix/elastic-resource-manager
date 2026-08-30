@@ -9,113 +9,191 @@ import threading
 from pathlib import Path
 from typing import List, Any, Dict
 
-from elastic_scheduler.jobs.job import JobRecord, JobRequest
+from elastic_scheduler.jobs.job import JobRecord, JobRequest, ElasticPhase
 
 logger = logging.getLogger(__name__)
 
-def _wait_and_allocate_nodes(policy_file: str, entry: Dict[str, Any], expand_nodes: List[str], 
-                             job_id: Any, runtime_nodes: Any, elastic_events: int, 
-                             timeout: float = 600.0, expand_start_time: float = None):
+def cleanup_stale_policy_entries(
+    policy_file: str, 
+    running_job_ids: List[str],
+    node_manager: Any = None
+) -> int:
     """
-    Wait in a background thread for policy to be applied during expansion.
-    This function runs in its own thread to avoid blocking the main scheduler.
+    Remove policy entries for jobs that are no longer running.
+    Returns number of entries cleaned up.
+    
+    This should be called periodically by the scheduler to handle cases where:
+    - Jobs completed before their elastic operation could be applied
+    - Jobs were killed/cancelled
     """
+    path = Path(policy_file)
+    if not path.exists() or path.stat().st_size == 0:
+        return 0
+    
+    cleaned = 0
+    running_ids_set = set(str(jid) for jid in running_job_ids)
+    
     try:
-        # Track when this specific job's expansion starts waiting
-        wait_start_time = time.time()
-        last_log_time = wait_start_time
-        
-        # Wait until policy is applied or timeout occurs
-        cancel_event = threading.Event()
-        
-        while not cancel_event.is_set():
-            if not policy_entry_exists(policy_file, entry):
-                # Policy applied
-                wait_duration = time.time() - wait_start_time
-                total_duration = time.time() - expand_start_time if expand_start_time else wait_duration
+        with path.open("r+", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                data = json.load(f)
+                jobs = data.get("jobs", [])
                 
-                logger.info(
-                    f"[Elastic Scaling] Job {job_id} +{len(expand_nodes)} nodes "
-                    f"(Now: {len(runtime_nodes)}). Events={elastic_events} "
-                    f"[Wait: {wait_duration:.2f}s, Total: {total_duration:.2f}s]"
-                )
-                return
+                stale_entries = []
+                remaining_jobs = []
                 
-            # Periodically log that we're still waiting
-            current_time = time.time()
-            if current_time - last_log_time >= 30.0:
-                elapsed = current_time - wait_start_time
-                logger.info(f"[Policy] Still waiting for expand to apply for Job {job_id} "
-                          f"(nodes: {len(expand_nodes)}, waiting: {elapsed:.1f}s)")
-                last_log_time = current_time
+                for entry in jobs:
+                    entry_id = str(entry.get("id", ""))
+                    if entry_id not in running_ids_set:
+                        stale_entries.append(entry)
+                        logger.warning(
+                            f"[Policy Cleanup] Removing stale entry for Job {entry_id} "
+                            f"(scale={entry.get('scale')}, nodes={entry.get('nodes')})"
+                        )
+                        
+                        # If it was an expand that never applied, free the nodes
+                        if entry.get("scale") == "expand" and node_manager:
+                            nodes_str = entry.get("nodes", "")
+                            if nodes_str:
+                                orphaned_nodes = nodes_str.split(",")
+                                node_manager.free_nodes(orphaned_nodes)
+                                logger.info(
+                                    f"[Policy Cleanup] Freed orphaned nodes from stale expand: "
+                                    f"{orphaned_nodes}"
+                                )
+                    else:
+                        remaining_jobs.append(entry)
                 
-            # Check for timeout
-            if timeout and (current_time - wait_start_time) > timeout:
-                logger.warning(
-                    f"[Policy] Expand for Job {job_id} not applied within {timeout}s timeout; "
-                    f"nodes may not be properly allocated: {entry['nodes']}."
-                )
-                return
+                if stale_entries:
+                    data["jobs"] = remaining_jobs
+                    f.seek(0)
+                    f.truncate()
+                    json.dump(data, f, indent=4)
+                    cleaned = len(stale_entries)
+                    
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
                 
-            # Sleep briefly to avoid CPU spin
-            time.sleep(1.0)
-            
     except Exception as e:
-        logger.error(f"[Policy] Error in background thread waiting for Job {job_id} expand: {e}")
+        logger.error(f"[Policy Cleanup] Failed to clean policy file: {e}")
+    
+    return cleaned
 
-def _wait_and_free_nodes(policy_file: str, entry: Dict[str, Any], shrink_nodes: List[str], 
-                        node_manager: Any, job_id: Any, runtime_nodes: Any, 
-                        elastic_events: int, timeout: float = 600.0, shrink_start_time: float = None):
+
+def mark_incomplete_phases_on_completion(job: JobRecord, success: bool = False) -> None:
     """
-    Wait in a background thread for policy to be applied, then free nodes.
-    This function runs in its own thread to avoid blocking the main scheduler.
+    Mark any pending elastic phases as failed when a job completes.
+    This handles the case where a scaling operation was requested but
+    the job finished before it could be applied.
     """
+    if not hasattr(job, 'runtime') or not hasattr(job.runtime, 'phases'):
+        return
+    
+    for phase in job.runtime.phases:
+        if phase.applied_time is None and phase.operation in ("expand", "shrink"):
+            phase.success = success
+            phase.end_time = time.time()
+            logger.warning(
+                f"[Elastic] Job {job.id} phase {phase.phase_id} ({phase.operation}) "
+                f"marked as incomplete - job completed before policy applied"
+            )
+
+def _wait_and_complete_expand(policy_file: str, entry: Dict[str, Any], 
+                               job: JobRecord, phase: 'ElasticPhase',
+                               node_manager: Any = None,
+                               timeout: float = 600.0):
+    """Wait for expand to complete and finalize phase tracking."""
+    success = check_complete(policy_file, entry, timeout=timeout)
+    
+    # Check if job is still running
+    job_still_running = getattr(job.runtime, 'completion_time', None) is None
+    
+    if success:
+        job.complete_expand(success=True)
+        logger.info(f"[Elastic] Job {job.id} expand phase completed: "
+                   f"{phase.nodes_before} -> {phase.nodes_after} nodes "
+                   f"in {phase.scaling_duration:.2f}s")
+    else:
+        # Policy wasn't applied - could be timeout or job completed
+        job.complete_expand(success=False)
+        
+        if not job_still_running:
+            logger.warning(f"[Elastic] Job {job.id} expand phase incomplete - "
+                          f"job finished before policy applied")
+            # Clean up the stale policy entry
+            _remove_policy_entry(policy_file, entry)
+            # Free the nodes that were allocated but never used
+            if node_manager and phase.nodes_added:
+                node_manager.free_nodes(phase.nodes_added)
+                logger.info(f"[Elastic] Freed unused expand nodes: {phase.nodes_added}")
+        else:
+            logger.warning(f"[Elastic] Job {job.id} expand phase timed out")
+
+def _wait_and_complete_shrink(policy_file: str, entry: Dict[str, Any], 
+                               job: JobRecord, phase: 'ElasticPhase',
+                               node_manager: Any = None,
+                               timeout: float = 600.0):
+    """Wait for shrink to complete and finalize phase tracking."""
+    success = check_complete(policy_file, entry, timeout=timeout)
+    
+    # Check if job is still running
+    job_still_running = getattr(job.runtime, 'completion_time', None) is None
+    
+    if success:
+        # Free nodes only after policy is applied
+        if node_manager and phase.nodes_removed:
+            node_manager.free_nodes(phase.nodes_removed)
+        job.complete_shrink(success=True)
+        logger.info(f"[Elastic] Job {job.id} shrink phase completed: "
+                   f"{phase.nodes_before} -> {phase.nodes_after} nodes "
+                   f"in {phase.scaling_duration:.2f}s")
+    else:
+        job.complete_shrink(success=False)
+        
+        if not job_still_running:
+            logger.warning(f"[Elastic] Job {job.id} shrink phase incomplete - "
+                          f"job finished before policy applied")
+            # Clean up the stale policy entry
+            _remove_policy_entry(policy_file, entry)
+            # The nodes were already removed from job.nodes, but shrink never happened
+            # So we need to add them back to the node manager as available
+            if node_manager and phase.nodes_removed:
+                node_manager.free_nodes(phase.nodes_removed)
+                logger.info(f"[Elastic] Freed nodes from incomplete shrink: {phase.nodes_removed}")
+        else:
+            logger.warning(f"[Elastic] Job {job.id} shrink phase timed out")
+
+
+def _remove_policy_entry(policy_file: str, entry: Dict[str, Any]) -> bool:
+    """Remove a specific entry from the policy file."""
+    path = Path(policy_file)
+    if not path.exists():
+        return False
+    
     try:
-        # Track when this specific job's shrink starts waiting
-        wait_start_time = time.time()
-        last_log_time = wait_start_time
-        
-        # Wait until policy is applied or timeout occurs
-        cancel_event = threading.Event()
-        
-        while not cancel_event.is_set():
-            if not policy_entry_exists(policy_file, entry):
-                # Policy applied - free the nodes
-                node_manager.free_nodes(shrink_nodes)
+        with path.open("r+", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                data = json.load(f)
+                jobs = data.get("jobs", [])
+                original_count = len(jobs)
                 
-                # Calculate timings
-                wait_duration = time.time() - wait_start_time
-                total_duration = time.time() - shrink_start_time if shrink_start_time else wait_duration
+                jobs = [e for e in jobs if not _policy_entry_matches(e, entry)]
                 
-                logger.info(
-                    f"[Elastic Scaling] Job {job_id} -{len(shrink_nodes)} nodes "
-                    f"(Now: {len(runtime_nodes)}). Events={elastic_events} "
-                    f"[Wait: {wait_duration:.2f}s, Total: {total_duration:.2f}s]"
-                )
-                return
-                
-            # Periodically log that we're still waiting
-            current_time = time.time()
-            if current_time - last_log_time >= 30.0:
-                elapsed = current_time - wait_start_time
-                logger.info(f"[Policy] Still waiting for shrink to apply for Job {job_id} "
-                          f"(nodes: {len(shrink_nodes)}, waiting: {elapsed:.1f}s)")
-                last_log_time = current_time
-                
-            # Check for timeout
-            if timeout and (current_time - wait_start_time) > timeout:
-                logger.warning(
-                    f"[Policy] Shrink for Job {job_id} not applied within {timeout}s timeout; "
-                    f"deferring free of nodes {entry['nodes']}."
-                )
-                return
-                
-            # Sleep briefly to avoid CPU spin
-            time.sleep(1.0)
-            
+                if len(jobs) < original_count:
+                    data["jobs"] = jobs
+                    f.seek(0)
+                    f.truncate()
+                    json.dump(data, f, indent=4)
+                    logger.info(f"[Policy] Removed stale entry for Job {entry.get('id')}")
+                    return True
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
     except Exception as e:
-        logger.error(f"[Policy] Error in background thread waiting for Job {job_id} shrink: {e}")
-
+        logger.error(f"[Policy] Failed to remove entry: {e}")
+    
+    return False
 
 def _is_elastic_capable(job: Any) -> bool:
     try:
@@ -323,6 +401,120 @@ def _shrink_all_equal(candidates: List[JobRecord]) -> List[JobRecord]:
     # The shrink function will handle removing nodes proportionally
     return candidates
 
+# ---------- Amdahl's Law Scalability Functions ----------
+
+def _get_serial_fraction(job: JobRecord) -> float:
+    """
+    Get the serial fraction for a job.
+    Tries job.serial_fraction first, then job.spec.serial_fraction.
+    Default to 0.1 (10% serial) if unknown.
+    """
+    # Try direct attribute first (from job JSON)
+    serial_fraction = getattr(job, 'serial_fraction', None)
+    if serial_fraction is not None:
+        try:
+            return float(serial_fraction)
+        except (ValueError, TypeError):
+            pass
+    
+    # Try spec attribute
+    if hasattr(job, 'spec'):
+        serial_fraction = getattr(job.spec, 'serial_fraction', None)
+        if serial_fraction is not None:
+            try:
+                return float(serial_fraction)
+            except (ValueError, TypeError):
+                pass
+    
+    # Default serial fraction
+    return 0.1
+
+
+def _amdahl_speedup(serial_fraction: float, num_processors: int) -> float:
+    """
+    Calculate theoretical speedup using Amdahl's law.
+    S(n) = 1 / (f + (1-f)/n)
+    where f is the serial fraction and n is the number of processors.
+    """
+    if num_processors <= 0:
+        return 1.0
+    if serial_fraction >= 1.0:
+        return 1.0
+    if serial_fraction <= 0.0:
+        return float(num_processors)
+    
+    return 1.0 / (serial_fraction + (1.0 - serial_fraction) / num_processors)
+
+
+def _parallel_efficiency(serial_fraction: float, num_processors: int) -> float:
+    """
+    Calculate parallel efficiency using Amdahl's law.
+    E(n) = S(n) / n = 1 / (n*f + (1-f))
+    where f is the serial fraction and n is the number of processors.
+    
+    Higher efficiency means the job is utilizing its nodes well.
+    """
+    if num_processors <= 0:
+        return 1.0
+    speedup = _amdahl_speedup(serial_fraction, num_processors)
+    return speedup / num_processors
+
+
+# ---------- Amdahl-based Expansion Strategy ----------
+
+def _expand_amdahl_most_scalable(candidates: List[JobRecord]) -> List[JobRecord]:
+    """
+    Sort by highest parallel efficiency first.
+    Jobs with higher parallel efficiency (better scaling) expand first
+    because they will make better use of additional nodes.
+    """
+    scored = []
+    for job in candidates:
+        serial_fraction = _get_serial_fraction(job)
+        current_nodes = len(job.nodes)
+        efficiency = _parallel_efficiency(serial_fraction, current_nodes)
+        headroom = job.max_nodes - current_nodes
+        
+        scored.append((job, efficiency, serial_fraction, headroom))
+        logger.info(
+            f"[Amdahl Expand] Job {job.id}: serial_fraction={serial_fraction:.4f}, "
+            f"nodes={current_nodes}, efficiency={efficiency:.4f}, headroom={headroom}"
+        )
+    
+    # Sort by efficiency descending (highest efficiency first = best scaling)
+    # Tie-breaker: more headroom
+    scored.sort(key=lambda x: (x[1], x[3]), reverse=True)
+    
+    return [job for job, eff, sf, hr in scored]
+
+
+# ---------- Amdahl-based Shrinking Strategy ----------
+
+def _shrink_amdahl_least_scalable(candidates: List[JobRecord]) -> List[JobRecord]:
+    """
+    Sort by lowest parallel efficiency first.
+    Jobs with lower parallel efficiency (poor scaling) shrink first
+    because they are not utilizing their nodes well anyway.
+    """
+    scored = []
+    for job in candidates:
+        serial_fraction = _get_serial_fraction(job)
+        current_nodes = len(job.nodes)
+        efficiency = _parallel_efficiency(serial_fraction, current_nodes)
+        shrinkable = current_nodes - job.min_nodes
+        
+        scored.append((job, efficiency, serial_fraction, shrinkable))
+        logger.info(
+            f"[Amdahl Shrink] Job {job.id}: serial_fraction={serial_fraction:.4f}, "
+            f"nodes={current_nodes}, efficiency={efficiency:.4f}, shrinkable={shrinkable}"
+        )
+    
+    # Sort by efficiency ascending (lowest efficiency first = worst scaling)
+    # Tie-breaker: more shrinkable nodes
+    scored.sort(key=lambda x: (x[1], -x[3]))
+    
+    return [job for job, eff, sf, sh in scored]
+
 # ---------- Strategy Registry ----------
 
 EXPAND_STRATEGIES = {
@@ -332,6 +524,7 @@ EXPAND_STRATEGIES = {
     "priority": _expand_highest_priority,
     "most_scalable": _expand_most_scalable,
     "equal": _expand_all_equal,
+    "amdahl": _expand_amdahl_most_scalable
 }
 
 SHRINK_STRATEGIES = {
@@ -341,6 +534,7 @@ SHRINK_STRATEGIES = {
     "priority": _shrink_lowest_priority,
     "most_nodes": _shrink_most_nodes,
     "equal": _shrink_all_equal,
+    "amdahl": _shrink_amdahl_least_scalable
 }
 
 # ---------- Updated Main Functions ----------
@@ -390,7 +584,7 @@ def expand_elastic_jobs(
     else:
         logger.info(f"[Elastic Scaling] Evolving job request for Job {candidates[0].id}. Expand by: {available_nodes}")
     
-    if strategy == "equal" and len(candidates) > 0:
+    if strategy == "equal" and not evolving_request and len(candidates) > 0:
         return _expand_equal_share(candidates, available_nodes, node_manager, policy_file)
     else:
         return _expand_sequential(candidates, available_nodes, node_manager, policy_file)
@@ -407,7 +601,7 @@ def _expand_sequential(candidates: List[JobRecord], available_nodes: int, node_m
         cooldown = _get_cooldown_period(rj)
         
         # Avoid rapid repeated expand attempts
-        if rj.runtime.elastic_events and (now - rj.runtime.last_elastic_time < cooldown):
+        if rj.spec.type != "evolving" and rj.runtime.elastic_events and (now - rj.runtime.last_elastic_time < cooldown):
             logger.info(f"[Elastic Scaling] Skipping rapid expand attempt for Job {rj.id}. "
                         f"Cooldown: {cooldown:.1f}s")
             continue
@@ -428,7 +622,7 @@ def _expand_sequential(candidates: List[JobRecord], available_nodes: int, node_m
         if not new_nodes:
             continue
 
-        rj.record_expand(new_nodes)
+        phase = rj.record_expand(new_nodes, trigger="scheduler")
 
         entry = {
             "id": str(rj.id),
@@ -441,10 +635,8 @@ def _expand_sequential(candidates: List[JobRecord], available_nodes: int, node_m
 
         # Launch background thread to wait for policy application
         thread = threading.Thread(
-            target=_wait_and_allocate_nodes,
-            args=(policy_file, entry, new_nodes, rj.id, 
-                  rj.runtime.nodes, rj.runtime.elastic_events),
-            kwargs={"expand_start_time": expand_start},
+            target=_wait_and_complete_expand,
+            args=(policy_file, entry, rj, phase),
             daemon=True,
             name=f"ExpandWaiter-{rj.id}"
         )
@@ -464,7 +656,7 @@ def _expand_sequential(candidates: List[JobRecord], available_nodes: int, node_m
     expand_duration = time.time() - expand_start
     
     logger.info(
-        f"[Elastic Scaling] Expand complete. "
+        f"[Elastic Scaling] Expand started. "
         f"Allocated {expanded_total}/{available_nodes} nodes. "
         f"Execution: {expand_duration:.3f}s. "
         f"{len(threads)} background threads active."
@@ -523,7 +715,7 @@ def _expand_equal_share(candidates: List[JobRecord], available_nodes: int, node_
         if not new_nodes:
             continue
 
-        job.record_expand(new_nodes)
+        phase = job.record_expand(new_nodes, trigger="scheduler")
 
         entry = {
             "id": str(job.id),
@@ -536,10 +728,8 @@ def _expand_equal_share(candidates: List[JobRecord], available_nodes: int, node_
 
         # Launch background thread
         thread = threading.Thread(
-            target=_wait_and_allocate_nodes,
-            args=(policy_file, entry, new_nodes, job.id, 
-                  job.runtime.nodes, job.runtime.elastic_events),
-            kwargs={"expand_start_time": expand_start},
+            target=_wait_and_complete_expand,
+            args=(policy_file, entry, job, phase),
             daemon=True,
             name=f"ExpandWaiter-{job.id}"
         )
@@ -556,7 +746,7 @@ def _expand_equal_share(candidates: List[JobRecord], available_nodes: int, node_
     expand_duration = time.time() - expand_start
     
     logger.info(
-        f"[Elastic Scaling] Equal-share expand complete. "
+        f"[Elastic Scaling] Equal-share expand started. "
         f"Allocated {expanded_total}/{available_nodes} nodes. "
         f"Execution: {expand_duration:.3f}s. "
         f"{len(threads)} background threads active."
@@ -609,75 +799,115 @@ def shrink_elastic_jobs(
     else:
         logger.info(f"[Elastic Scaling] Evolving job request for Job {candidates[0].id}. Shrink by: {required_nodes}")
     
-    if strategy == "equal" and len(candidates) > 0:
+    if strategy == "equal" and not evolving_request and len(candidates) > 1:
         return _shrink_equal_share(candidates, required_nodes, node_manager, policy_file)
     else:
-        return _shrink_sequential(candidates, required_nodes, node_manager, policy_file)
+        return _shrink_sequential(candidates, required_nodes, node_manager, policy_file, evolving_request)
 
-def _shrink_sequential(candidates: List[JobRecord], required_nodes: int, node_manager: Any, policy_file: str) -> int:
+def _shrink_sequential(candidates: List[JobRecord], required_nodes: int, node_manager: Any, policy_file: str, evolving_request: bool = False) -> int:
     """Shrink jobs sequentially according to the provided order, with validation phase and timing."""
     
-    # Phase 1: Validation - Check if we can meet requirements without actually shrinking
-    validation_start = time.time()
-    freed_total = 0
+    logger.info(f"[Elastic Scaling] Starting sequential shrink to free {required_nodes} nodes from {len(candidates)} candidates.")
+    
     shrink_plan = []  # List of (job, shrink_nodes, shrink_num) tuples
+    freed_total = 0
     
-    for rj in candidates:
-        if freed_total >= required_nodes:
-            break
+    if evolving_request:
+        # Skip validation for evolving requests - create shrink plan directly
+        execution_start = time.time()
+        
+        for rj in candidates:
+            if freed_total >= required_nodes:
+                break
             
-        now = time.time()
-        cooldown = _get_cooldown_period(rj)
+            # Skip if already has pending policy entry
+            if policy_has_job(policy_file, rj.id):
+                logger.info(f"[Elastic Scaling] Skipping Job {rj.id} - policy entry exists")
+                continue
+
+            extra = len(rj.nodes) - rj.min_nodes
+            if extra <= 0:
+                continue
+
+            shrink_num = min(extra, required_nodes - freed_total)
+            if shrink_num <= 0:
+                continue
+
+            # Get nodes to shrink
+            nodes_copy = list(rj.nodes)
+            potential_shrink = nodes_copy[-shrink_num:] if shrink_num <= len(nodes_copy) else []
+            
+            if not potential_shrink:
+                continue
+
+            shrink_plan.append((rj, potential_shrink, shrink_num))
+            freed_total += shrink_num
+            
+            logger.info(f"[Elastic Scaling] Evolving job {rj.id} will provide {shrink_num} nodes")
         
-        # Skip if in cooldown
-        if rj.runtime.elastic_events and (now - rj.runtime.last_elastic_time < cooldown):
-            logger.info(f"[Elastic Scaling][Validation] Skipping Job {rj.id} - in cooldown ({cooldown:.1f}s)")
-            continue
-
-        # Skip if already has pending policy entry
-        if policy_has_job(policy_file, rj.id):
-            logger.info(f"[Elastic Scaling][Validation] Skipping Job {rj.id} - policy entry exists")
-            continue
-
-        extra = len(rj.nodes) - rj.min_nodes
-        if extra <= 0:
-            continue
-
-        shrink_num = min(extra, required_nodes - freed_total)
-        if shrink_num <= 0:
-            continue
-
-        # Simulate the split (don't actually modify the job yet)
-        nodes_copy = list(rj.nodes)
-        potential_shrink = nodes_copy[-shrink_num:] if shrink_num <= len(nodes_copy) else []
+        validation_duration = 0.0  # No validation for evolving requests
         
-        if not potential_shrink:
-            continue
-
-        shrink_plan.append((rj, potential_shrink, shrink_num))
-        freed_total += shrink_num
+    else:
+        # Phase 1: Validation - Check if we can meet requirements without actually shrinking
+        validation_start = time.time()
         
-        logger.info(f"[Elastic Scaling][Validation] Job {rj.id} can provide {shrink_num} nodes")
+        for rj in candidates:
+            if freed_total >= required_nodes:
+                break
+                
+            now = time.time()
+            cooldown = _get_cooldown_period(rj)
+            
+            # Skip if in cooldown
+            if rj.runtime.elastic_events and (now - rj.runtime.last_elastic_time < cooldown):
+                logger.info(f"[Elastic Scaling][Validation] Skipping Job {rj.id} - in cooldown ({cooldown:.1f}s)")
+                continue
 
-    validation_duration = time.time() - validation_start
+            # Skip if already has pending policy entry
+            if policy_has_job(policy_file, rj.id):
+                logger.info(f"[Elastic Scaling][Validation] Skipping Job {rj.id} - policy entry exists")
+                continue
 
-    # Check if we can meet the requirement
-    if freed_total < required_nodes:
-        logger.warning(
-            f"[Elastic Scaling][Validation] Cannot meet requirement. "
-            f"Need {required_nodes} nodes, can only free {freed_total} nodes. "
-            f"Validation took {validation_duration:.3f}s. Aborting shrink operation."
+            extra = len(rj.nodes) - rj.min_nodes
+            if extra <= 0:
+                continue
+
+            shrink_num = min(extra, required_nodes - freed_total)
+            if shrink_num <= 0:
+                continue
+
+            # Simulate the split (don't actually modify the job yet)
+            nodes_copy = list(rj.nodes)
+            potential_shrink = nodes_copy[-shrink_num:] if shrink_num <= len(nodes_copy) else []
+            
+            if not potential_shrink:
+                continue
+
+            shrink_plan.append((rj, potential_shrink, shrink_num))
+            freed_total += shrink_num
+            
+            logger.info(f"[Elastic Scaling][Validation] Job {rj.id} can provide {shrink_num} nodes")
+
+        validation_duration = time.time() - validation_start
+
+        # Check if we can meet the requirement
+        if freed_total < required_nodes:
+            logger.warning(
+                f"[Elastic Scaling][Validation] Cannot meet requirement. "
+                f"Need {required_nodes} nodes, can only free {freed_total} nodes. "
+                f"Validation took {validation_duration:.3f}s. Aborting shrink operation."
+            )
+            return 0
+        
+        logger.info(
+            f"[Elastic Scaling][Validation] Validation passed in {validation_duration:.3f}s. "
+            f"Can free {freed_total}/{required_nodes} nodes from {len(shrink_plan)} jobs. "
+            f"Proceeding with shrink."
         )
-        return 0
-    
-    logger.info(
-        f"[Elastic Scaling][Validation] Validation passed in {validation_duration:.3f}s. "
-        f"Can free {freed_total}/{required_nodes} nodes from {len(shrink_plan)} jobs. "
-        f"Proceeding with shrink."
-    )
+        
+        execution_start = time.time()
     
     # Phase 2: Execution - Actually perform the shrinking
-    execution_start = time.time()
     actual_freed = 0
     threads = []  # Track all threads
     
@@ -693,7 +923,7 @@ def _shrink_sequential(candidates: List[JobRecord], required_nodes: int, node_ma
             logger.warning(f"[Elastic Scaling][Execution] Failed to split nodes for Job {rj.id}")
             continue
 
-        rj.record_shrink(shrink_nodes)
+        phase = rj.record_shrink(shrink_nodes, trigger="scheduler" if not evolving_request else "evolving")
 
         entry = {
             "id": str(rj.id),
@@ -706,10 +936,9 @@ def _shrink_sequential(candidates: List[JobRecord], required_nodes: int, node_ma
 
         # Launch background thread to wait for policy application and free nodes
         thread = threading.Thread(
-            target=_wait_and_free_nodes,
-            args=(policy_file, entry, shrink_nodes, node_manager, rj.id, 
-                  rj.runtime.nodes, rj.runtime.elastic_events),
-            kwargs={"shrink_start_time": execution_start},
+            target=_wait_and_complete_shrink,
+            args=(policy_file, entry, rj, phase),
+            kwargs={"node_manager": node_manager},
             daemon=True,
             name=f"ShrinkWaiter-{rj.id}"
         )
@@ -719,7 +948,7 @@ def _shrink_sequential(candidates: List[JobRecord], required_nodes: int, node_ma
         actual_freed += len(shrink_nodes)
         
         logger.info(
-            f"[Elastic Scaling][Execution] Job {rj.id} -{len(shrink_nodes)} nodes "
+            f"[Elastic Scaling][Execution] Job {rj.id} -{len(shrink_nodes)} "
             f"(Now: {len(rj.runtime.nodes)}). Events={rj.runtime.elastic_events} "
             f"[Thread started]"
         )
@@ -730,13 +959,21 @@ def _shrink_sequential(candidates: List[JobRecord], required_nodes: int, node_ma
     execution_duration = time.time() - execution_start
     
     # Log summary with timing breakdown
-    logger.info(
-        f"[Elastic Scaling] Shrink complete. "
-        f"Freed {actual_freed}/{required_nodes} nodes. "
-        f"Validation: {validation_duration:.3f}s, Execution: {execution_duration:.3f}s, "
-        f"Total: {validation_duration + execution_duration:.3f}s. "
-        f"{len(threads)} background threads active."
-    )
+    if evolving_request:
+        logger.info(
+            f"[Elastic Scaling] Evolving shrink started. "
+            f"Freed {actual_freed}/{required_nodes} nodes. "
+            f"Execution: {execution_duration:.3f}s. "
+            f"{len(threads)} background threads active."
+        )
+    else:
+        logger.info(
+            f"[Elastic Scaling] Shrink started. "
+            f"Freed {actual_freed}/{required_nodes} nodes. "
+            f"Validation: {validation_duration:.3f}s, Execution: {execution_duration:.3f}s, "
+            f"Total: {validation_duration + execution_duration:.3f}s. "
+            f"{len(threads)} background threads active."
+        )
     
     return actual_freed
 
@@ -830,7 +1067,7 @@ def _shrink_equal_share(candidates: List[JobRecord], required_nodes: int, node_m
             logger.warning(f"[Elastic Scaling][Execution] Failed to split nodes for Job {job.id}")
             continue
 
-        job.record_shrink(shrink_nodes)
+        phase = job.record_shrink(shrink_nodes, trigger="scheduler")
 
         entry = {
             "id": str(job.id),
@@ -843,10 +1080,9 @@ def _shrink_equal_share(candidates: List[JobRecord], required_nodes: int, node_m
 
         # Launch background thread
         thread = threading.Thread(
-            target=_wait_and_free_nodes,
-            args=(policy_file, entry, shrink_nodes, node_manager, job.id, 
-                  job.runtime.nodes, job.runtime.elastic_events),
-            kwargs={"shrink_start_time": execution_start},
+            target=_wait_and_complete_shrink,
+            args=(policy_file, entry, job, phase),
+            kwargs={"node_manager": node_manager},
             daemon=True,
             name=f"ShrinkWaiter-{job.id}"
         )
@@ -856,7 +1092,7 @@ def _shrink_equal_share(candidates: List[JobRecord], required_nodes: int, node_m
         actual_freed += len(shrink_nodes)
         
         logger.info(
-            f"[Elastic Scaling][Execution] Job {job.id} -{len(shrink_nodes)} nodes "
+            f"[Elastic Scaling][Execution] Job {job.id} -{len(shrink_nodes)} "
             f"(Now: {len(job.runtime.nodes)}, proportional). Events={job.runtime.elastic_events} "
             f"[Thread started]"
         )
@@ -867,7 +1103,7 @@ def _shrink_equal_share(candidates: List[JobRecord], required_nodes: int, node_m
     execution_duration = time.time() - execution_start
 
     logger.info(
-        f"[Elastic Scaling] Proportional shrink complete. "
+        f"[Elastic Scaling] Proportional shrink started. "
         f"Freed {actual_freed}/{required_nodes} nodes. "
         f"Validation: {validation_duration:.3f}s, Execution: {execution_duration:.3f}s, "
         f"Total: {validation_duration + execution_duration:.3f}s. "
@@ -890,8 +1126,7 @@ def handle_evolving_job_requests(
     """
     if job_record.spec.type != "evolving":
         logger.error(f"Job {job_request.job_id} is not of type 'evolving'. Cannot process request.")
-        update_job_requests_status(job_request.job_id, "rejected", evolving_job_requests_file)
-        remove_job_requests_by_id(job_request.job_id, evolving_job_requests_file)
+        update_and_remove_job_request(job_request.job_id, "rejected", evolving_job_requests_file)
         return
     
     jid = str(job_request.job_id)
@@ -902,14 +1137,12 @@ def handle_evolving_job_requests(
         req_nodes = int(job_request.num_nodes)
     except Exception:
         logger.error(f"[Evolving] Invalid num_nodes in request for Job {jid}: {job_request.num_nodes}")
-        update_job_requests_status(job_request.job_id, "rejected", evolving_job_requests_file)
-        remove_job_requests_by_id(job_request.job_id, evolving_job_requests_file)
+        update_and_remove_job_request(job_request.job_id, "rejected", evolving_job_requests_file)
         return
 
     if req_nodes <= 0:
         logger.info(f"[Evolving] Rejecting request for Job {jid}: num_nodes must be > 0")
-        update_job_requests_status(job_request.job_id, "rejected", evolving_job_requests_file)
-        remove_job_requests_by_id(job_request.job_id, evolving_job_requests_file)
+        update_and_remove_job_request(job_request.job_id, "rejected", evolving_job_requests_file)
         return
 
     cur = len(job_record.nodes)
@@ -922,8 +1155,7 @@ def handle_evolving_job_requests(
         expand_by = min(req_nodes, headroom, max(0, int(available_nodes)))
         if expand_by <= 0:
             logger.info(f"[Evolving] Expand rejected for Job {jid}: requested={req_nodes}, headroom={headroom}, available={available_nodes}")
-            update_job_requests_status(job_request.job_id, "rejected", evolving_job_requests_file)
-            remove_job_requests_by_id(job_request.job_id, evolving_job_requests_file)
+            update_and_remove_job_request(job_request.job_id, "rejected", evolving_job_requests_file)
             return
 
         # Expand only this job by passing [job_record] and limiting available_nodes
@@ -936,13 +1168,10 @@ def handle_evolving_job_requests(
         )
         if gained > 0:
             logger.info(f"[Evolving] Expand accepted for Job {jid}: +{gained} nodes")
-            # Mark applied and remove the request (prevents resubmission)
-            update_job_requests_status(job_request.job_id, "applied", evolving_job_requests_file)
-            remove_job_requests_by_id(job_request.job_id, evolving_job_requests_file)
+            update_and_remove_job_request(job_request.job_id, "applied", evolving_job_requests_file)
         else:
             logger.info(f"[Evolving] Expand could not be applied for Job {jid}")
-            update_job_requests_status(job_request.job_id, "rejected", evolving_job_requests_file)
-            remove_job_requests_by_id(job_request.job_id, evolving_job_requests_file)
+            update_and_remove_job_request(job_request.job_id, "rejected", evolving_job_requests_file)
         return
 
     if scale == "shrink":
@@ -951,8 +1180,7 @@ def handle_evolving_job_requests(
         shrink_by = min(req_nodes, shrinkable)
         if shrink_by <= 0:
             logger.info(f"[Evolving] Shrink rejected for Job {jid}: requested={req_nodes}, shrinkable={shrinkable}")
-            update_job_requests_status(job_request.job_id, "rejected", evolving_job_requests_file)
-            remove_job_requests_by_id(job_request.job_id, evolving_job_requests_file)
+            update_and_remove_job_request(job_request.job_id, "rejected", evolving_job_requests_file)
             return
 
         freed = shrink_elastic_jobs(
@@ -964,62 +1192,73 @@ def handle_evolving_job_requests(
         )
         if freed > 0:
             logger.info(f"[Evolving] Shrink accepted for Job {jid}: -{freed} nodes")
-            update_job_requests_status(job_request.job_id, "applied", evolving_job_requests_file)
-            remove_job_requests_by_id(job_request.job_id, evolving_job_requests_file)
+            update_and_remove_job_request(job_request.job_id, "applied", evolving_job_requests_file)
         else:
             logger.info(f"[Evolving] Shrink could not be applied for Job {jid}")
-            update_job_requests_status(job_request.job_id, "rejected", evolving_job_requests_file)
-            remove_job_requests_by_id(job_request.job_id, evolving_job_requests_file)
+            update_and_remove_job_request(job_request.job_id, "rejected", evolving_job_requests_file)
         return
 
     logger.error(f"[Evolving] Unknown scale '{scale}' for Job {jid}")
-    update_job_requests_status(job_request.job_id, "rejected", evolving_job_requests_file)
-    remove_job_requests_by_id(job_request.job_id, evolving_job_requests_file)
+    update_and_remove_job_request(job_request.job_id, "rejected", evolving_job_requests_file)
 
-def remove_job_requests_by_id(job_id, evolving_job_requests_file: str = "jobrequests.json") -> bool:
-    try:
-        with open(evolving_job_requests_file, 'r+') as file:
-            fcntl.flock(file, fcntl.LOCK_EX)
-            try:
-                data = json.load(file)
-                job_requests = data.get("job_requests", [])
-                new_job_requests = [job_request for job_request in job_requests if job_request["job_id"] != str(job_id)]
-
-                if len(job_requests) == len(new_job_requests):
-                    logger.info(f"No job request with ID {job_id} found to remove.")
-                    return False
-
-                data["job_requests"] = new_job_requests
-                file.seek(0)
-                file.truncate()
-                json.dump(data, file, indent=4)
-                logger.info(f"Job request from job id {job_id} removed.")
-                return True
-            finally:
-                fcntl.flock(file, fcntl.LOCK_UN)
-
-    except (FileNotFoundError, json.JSONDecodeError):
-        logger.error("File not found or contains invalid JSON.")
-        return False
-
-def update_job_requests_status(job_id, status, evolving_job_requests_file: str = "jobrequests.json") -> None:
-    """Update job status in JSON file."""
+def update_and_remove_job_request(job_id, status, evolving_job_requests_file: str = "jobrequests.json") -> bool:
+    """Atomically update job status and remove it from the file."""
     if not os.path.exists(evolving_job_requests_file):
         logger.info("No job requests file found")
-        return
+        return False
 
-    with open(evolving_job_requests_file, "r+") as file:
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
-            job_requests = json.load(file)
-            for job_request in job_requests.get("job_requests", []):
-                if int(job_request.get("job_id")) == int(job_id):
-                    job_request["status"] = status
-                    break
+            with open(evolving_job_requests_file, "r+") as file:
+                fcntl.flock(file, fcntl.LOCK_EX)
+                try:
+                    content = file.read()
+                    if not content.strip():
+                        logger.warning(f"Job requests file is empty: {evolving_job_requests_file}")
+                        return False
+                    
+                    data = json.loads(content)
+                    job_requests = data.get("job_requests", [])
+                    
+                    # Update status (for logging purposes) and remove in one pass
+                    new_job_requests = []
+                    removed = False
+                    for job_request in job_requests:
+                        if str(job_request.get("job_id")) == str(job_id):
+                            logger.info(f"Job {job_id} status: {status} - removing from file")
+                            removed = True
+                            # Don't add to new list (effectively removes it)
+                        else:
+                            new_job_requests.append(job_request)
+                    
+                    if not removed:
+                        logger.info(f"No job request with ID {job_id} found")
+                        return False
 
-            # Write back the updated job list
-            file.seek(0)
-            json.dump(job_requests, file, indent=4)
-            file.truncate()
-            logger.info("Updated Job Request File")
-        except json.JSONDecodeError:
-            print("Invalid JSON format in job file.")
+                    data["job_requests"] = new_job_requests
+                    
+                    # Write atomically
+                    file.seek(0)
+                    file.truncate()
+                    json.dump(data, file, indent=4)
+                    file.flush()
+                    os.fsync(file.fileno())
+                    
+                    logger.info(f"Job request {job_id} ({status}) removed successfully")
+                    return True
+                finally:
+                    fcntl.flock(file, fcntl.LOCK_UN)
+
+        except json.JSONDecodeError as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"JSON decode error (attempt {attempt + 1}/{max_retries}), retrying: {e}")
+                time.sleep(0.1)
+                continue
+            logger.error(f"Invalid JSON in {evolving_job_requests_file}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Error updating/removing job request: {e}")
+            return False
+    
+    return False

@@ -1,5 +1,6 @@
 
 import logging
+import threading
 import os
 import time
 import subprocess
@@ -14,6 +15,32 @@ class NodeManager:
         self.total_nodes = total_nodes
         self.hostfile_path = hostfile_path
         self.name_pm = name_pm
+        # Node tracking
+        self._lock = threading.Lock()
+        self._available_count: int = -1  # -1 means uninitialized
+        
+        # Initialize from hostfile
+        self._initialize_tracking()
+
+    def _initialize_tracking(self) -> None:
+        """Initialize node count from hostfile."""
+        with self._lock:
+            try:
+                nodes = self._read_hostfile_unlocked()
+                self._available_count = len(nodes)
+                logger.info(f"[NodeManager] Initialized with {self._available_count} available nodes")
+            except Exception as e:
+                logger.error(f"[NodeManager] Failed to initialize: {e}")
+                self._available_count = 0
+
+    def _read_hostfile_unlocked(self) -> List[str]:
+        """Read hostfile without lock (internal use)."""
+        try:
+            with open(self.hostfile_path, 'r') as file:
+                return [line.strip() for line in file if line.strip()]
+        except FileNotFoundError:
+            logger.warning(f"Hostfile not found: {self.hostfile_path}")
+            return []
 
     def read_hostfile(self) -> List[str]:
         """Read available nodes from the hostfile."""
@@ -38,6 +65,7 @@ class NodeManager:
             remaining_nodes = available_nodes[num_nodes:]
             self.write_hostfile(remaining_nodes)
             logger.info(f"Nodes Allocated: {allocated_nodes}")
+            self._available_count -= len(allocated_nodes)
             return allocated_nodes
         logger.info(f"Not enough nodes available to allocate {num_nodes} nodes.")
         return None
@@ -49,6 +77,7 @@ class NodeManager:
         # Remove duplicates and sort for consistency
         unique_nodes = sorted(set(available_nodes))
         self.write_hostfile(unique_nodes)
+        self._available_count += len(unique_nodes)
         logger.info(f"Nodes Freed: {allocated_nodes}")
 
     def start_process_manager(self, dvm_file_path: str, timeout: int = 1) -> int:
